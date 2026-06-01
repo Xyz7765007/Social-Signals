@@ -1,11 +1,12 @@
 /**
  * Storage abstraction.
  *
- * Default: file-based at .data/scans.json (works locally; ephemeral on Vercel).
- * For production on Vercel, swap to KV/Postgres/Airtable by implementing the
- * `Storage` interface and exporting an instance from this file.
+ * Default: file-based at .data/{scans.json,seen.json} for local dev.
+ * Memory: ephemeral in-process for serverless without external store.
+ * Airtable: see ./airtable.ts (drop-in when env vars are set).
  *
- * Why file-based as default: zero setup for `npm run dev`. Swap is one file edit.
+ * Scan storage holds full Scan records.
+ * Seen storage holds Set<externalId> per campaignKey for cross-scan dedup.
  */
 
 import { promises as fs } from "fs";
@@ -17,81 +18,87 @@ export interface Storage {
   get(id: string): Promise<Scan | null>;
   put(scan: Scan): Promise<void>;
   delete(id: string): Promise<void>;
+
+  // Campaign-level cross-scan dedup
+  getSeen(campaignKey: string): Promise<Set<string>>;
+  addSeen(campaignKey: string, ids: string[]): Promise<void>;
 }
 
 const DATA_DIR = path.join(process.cwd(), ".data");
 const SCANS_FILE = path.join(DATA_DIR, "scans.json");
+const SEEN_FILE = path.join(DATA_DIR, "seen.json");
 
-async function ensure(): Promise<void> {
-  try {
-    await fs.mkdir(DATA_DIR, { recursive: true });
-    await fs.access(SCANS_FILE);
-  } catch {
-    await fs.writeFile(SCANS_FILE, "[]", "utf8");
-  }
+async function ensureDir(): Promise<void> {
+  try { await fs.mkdir(DATA_DIR, { recursive: true }); } catch {}
 }
-
-async function readAll(): Promise<Scan[]> {
-  await ensure();
-  const raw = await fs.readFile(SCANS_FILE, "utf8");
-  try {
-    return JSON.parse(raw) as Scan[];
-  } catch {
-    return [];
-  }
+async function readJson<T>(file: string, fallback: T): Promise<T> {
+  await ensureDir();
+  try { return JSON.parse(await fs.readFile(file, "utf8")) as T; } catch { return fallback; }
 }
-
-async function writeAll(scans: Scan[]): Promise<void> {
-  await ensure();
-  await fs.writeFile(SCANS_FILE, JSON.stringify(scans, null, 2), "utf8");
+async function writeJson(file: string, data: unknown): Promise<void> {
+  await ensureDir();
+  await fs.writeFile(file, JSON.stringify(data, null, 2), "utf8");
 }
 
 class FileStorage implements Storage {
-  async list(): Promise<Scan[]> {
-    const all = await readAll();
+  async list() {
+    const all = await readJson<Scan[]>(SCANS_FILE, []);
     return all.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
-  async get(id: string): Promise<Scan | null> {
-    const all = await readAll();
+  async get(id: string) {
+    const all = await readJson<Scan[]>(SCANS_FILE, []);
     return all.find((s) => s.id === id) ?? null;
   }
-  async put(scan: Scan): Promise<void> {
-    const all = await readAll();
+  async put(scan: Scan) {
+    const all = await readJson<Scan[]>(SCANS_FILE, []);
     const idx = all.findIndex((s) => s.id === scan.id);
-    if (idx === -1) all.push(scan);
-    else all[idx] = scan;
-    await writeAll(all);
+    if (idx === -1) all.push(scan); else all[idx] = scan;
+    await writeJson(SCANS_FILE, all);
   }
-  async delete(id: string): Promise<void> {
-    const all = await readAll();
-    await writeAll(all.filter((s) => s.id !== id));
+  async delete(id: string) {
+    const all = await readJson<Scan[]>(SCANS_FILE, []);
+    await writeJson(SCANS_FILE, all.filter((s) => s.id !== id));
+  }
+  async getSeen(campaignKey: string) {
+    const seen = await readJson<Record<string, string[]>>(SEEN_FILE, {});
+    return new Set(seen[campaignKey] ?? []);
+  }
+  async addSeen(campaignKey: string, ids: string[]) {
+    const seen = await readJson<Record<string, string[]>>(SEEN_FILE, {});
+    const set = new Set(seen[campaignKey] ?? []);
+    for (const id of ids) set.add(id);
+    // Cap at 5000 IDs per campaign to bound file size — drop oldest if exceeded
+    const arr = Array.from(set);
+    seen[campaignKey] = arr.slice(-5000);
+    await writeJson(SEEN_FILE, seen);
   }
 }
 
-// In-memory shim for serverless cold starts — same process keeps state warm.
-// On Vercel/serverless this only persists for the function lifetime; production
-// should switch to KV/Postgres/Airtable adapter.
 class MemoryStorage implements Storage {
   private store = new Map<string, Scan>();
-  async list() {
-    return Array.from(this.store.values()).sort((a, b) =>
-      b.createdAt.localeCompare(a.createdAt)
-    );
-  }
-  async get(id: string) {
-    return this.store.get(id) ?? null;
-  }
-  async put(scan: Scan) {
-    this.store.set(scan.id, scan);
-  }
-  async delete(id: string) {
-    this.store.delete(id);
+  private seen = new Map<string, Set<string>>();
+  async list() { return Array.from(this.store.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
+  async get(id: string) { return this.store.get(id) ?? null; }
+  async put(scan: Scan) { this.store.set(scan.id, scan); }
+  async delete(id: string) { this.store.delete(id); }
+  async getSeen(campaignKey: string) { return new Set(this.seen.get(campaignKey) ?? []); }
+  async addSeen(campaignKey: string, ids: string[]) {
+    const cur = this.seen.get(campaignKey) ?? new Set<string>();
+    for (const id of ids) cur.add(id);
+    this.seen.set(campaignKey, cur);
   }
 }
 
 const useMemory = process.env.VERCEL === "1" || process.env.NODE_ENV === "production";
-
-// Avoid re-instantiating across hot reloads.
 const g = globalThis as any;
-export const storage: Storage =
-  g.__pulseStorage ?? (g.__pulseStorage = useMemory ? new MemoryStorage() : new FileStorage());
+
+function selectStorage(): Storage {
+  const { maybeAirtable } = require("./airtable") as typeof import("./airtable");
+  const airtable = maybeAirtable();
+  if (airtable) return airtable;
+  return useMemory ? new MemoryStorage() : new FileStorage();
+}
+
+export const storage: Storage = g.__pulseStorage ?? (g.__pulseStorage = selectStorage());
+
+export { FileStorage, MemoryStorage };

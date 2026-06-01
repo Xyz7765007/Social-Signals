@@ -97,9 +97,17 @@ export default function ScanPage() {
         <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] font-mono text-[var(--text-faint)] uppercase tracking-[0.16em]">
           <span>Source: Reddit</span>
           <span>Window: {scan.input.timeWindow}</span>
-          <span>Targets: {scan.input.signalTypes.length}</span>
-          {scan.stats && <span>Duration: {(scan.stats.durationMs / 1000).toFixed(1)}s</span>}
-          {scan.stats && <span>Cost: ${scan.stats.costUsd.toFixed(3)}</span>}
+          {scan.input.campaignKey && <span>Campaign: {scan.input.campaignKey}</span>}
+          {scan.stats && (
+            <>
+              <span>Posts: {scan.stats.postCount}</span>
+              {scan.stats.commentCount > 0 && <span>Comments: {scan.stats.commentCount}</span>}
+              {scan.stats.duplicateCount > 0 && <span>Skipped: {scan.stats.duplicateCount}</span>}
+              {scan.stats.hubspotTasksCreated > 0 && <span>HubSpot: {scan.stats.hubspotTasksCreated} tasks</span>}
+              <span>Duration: {(scan.stats.durationMs / 1000).toFixed(1)}s</span>
+              <span>Cost: ${scan.stats.costUsd.toFixed(3)}</span>
+            </>
+          )}
         </div>
       </div>
 
@@ -207,7 +215,16 @@ export default function ScanPage() {
 }
 
 function ProgressPane({ scan }: { scan: Scan }) {
-  const stages = ["expanding", "fetching", "scoring", "complete"] as const;
+  const stages = ["expanding", "fetching", "fetching_comments", "enriching", "scoring", "drafting", "pushing"] as const;
+  const stageLabels: Record<string, string> = {
+    expanding: "Expand",
+    fetching: "Fetch",
+    fetching_comments: "Comments",
+    enriching: "Enrich",
+    scoring: "Score",
+    drafting: "Draft",
+    pushing: "Push",
+  };
   const currentIdx = stages.indexOf(scan.progress.status as any);
   const pct =
     scan.progress.total > 0
@@ -231,8 +248,8 @@ function ProgressPane({ scan }: { scan: Scan }) {
           style={{ width: `${pct}%` }}
         />
       </div>
-      <div className="mt-4 grid grid-cols-4 gap-2 text-[10px] font-mono uppercase tracking-[0.15em]">
-        {stages.slice(0, 4).map((s, i) => (
+      <div className="mt-4 grid grid-cols-4 sm:grid-cols-7 gap-2 text-[10px] font-mono uppercase tracking-[0.15em]">
+        {stages.map((s, i) => (
           <div
             key={s}
             className={
@@ -241,7 +258,7 @@ function ProgressPane({ scan }: { scan: Scan }) {
                 : "text-[var(--text-faint)] opacity-50"
             }
           >
-            {String(i + 1).padStart(2, "0")} {s}
+            {String(i + 1).padStart(2, "0")} {stageLabels[s]}
           </div>
         ))}
       </div>

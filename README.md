@@ -1,160 +1,205 @@
 # Pulse
 
-Signal intelligence for B2B outbound. Customer describes their business and ICP; Pulse surfaces real Reddit conversations matching that intent, ranked by Claude with one-line reply suggestions per signal.
+Signal intelligence for B2B outbound. Customer describes their business + ICP; Pulse surfaces real Reddit posts **and comments** matching that intent — author-checked, intent-scored, with reply drafts in the customer's voice and optional HubSpot push.
 
 Built with extensibility from day one — Twitter/X, news, and Instagram drop in behind the same `Source` interface.
 
 ---
 
-## Why this Reddit API choice
+## Pipeline (per scan)
 
-**Official Reddit API via OAuth client credentials.** Picked over:
+```
+expanding         AI generates keywords + subreddits from business + ICP
+fetching          Reddit search across keyword × subreddit × time-window
+fetching_comments Top comments pulled for engaged posts (toggle)
+dedup_seen        Skip externalIds already seen on this campaign
+enriching         Author profile fetch + Claude read of recent subreddits (toggle)
+scoring           Claude scores each item with anti-signals + author adjustments
+drafting          Reply drafts in client's voice for signals ≥ 60 (toggle)
+pushing           HubSpot Tasks for signals ≥ threshold (when token set)
+complete          Done — UI shows ranked, filterable signals
+```
 
-| Option | Verdict | Why |
-| --- | --- | --- |
-| **Reddit OAuth (chosen)** | ✅ | Free 100 req/min. Native time filtering (`hour`/`day`/`week`/`month`). ToS-compliant for commercial use. Structured data, no parsing risk. |
-| Reddit `.json` unauthenticated | ❌ | IP-blocked at scale. ToS-grey for commercial. Unreliable. |
-| Pushshift | ❌ | Effectively shut down after Reddit's 2023 API changes. |
-| Apify Reddit scraper | 🔜 | Reserved for **Phase 2**: deeper historical search past Reddit's 1000-result depth cap. Pay-per-use ($1.50/1k). |
-| Bright Data / ScraperAPI | ❌ | Expensive ($500+/mo entry). Overkill until we hit Reddit's free-tier ceiling. |
+## Why these Reddit providers
 
-The free tier comfortably covers >1,000 scans/day for a small customer base. When we hit limits, the architecture allows adding Apify in parallel without changing the consumer-facing flow.
+Pulse supports **two Reddit providers**, picks automatically by env vars, switchable via `REDDIT_PROVIDER`.
+
+| Provider | Setup | Cost | When |
+| --- | --- | --- | --- |
+| **Reddit OAuth** | Reddit app + client_credentials | Free (100 req/min) | Default when you can create a Reddit app |
+| **Apify** (`trudax/reddit-scraper-lite`) | Drop `APIFY_TOKEN` | ~$3.40 per 1k results | When Reddit app creation is blocked |
+
+Both implement the same `Source` interface — UI, scoring, dedup, drafts, HubSpot push all work unchanged.
 
 ---
 
-## Architecture
+## What's new in v0.2
 
+| Feature | Where | Why |
+| --- | --- | --- |
+| **Comments scanning** | `lib/sources/reddit-{oauth,apify}.ts` → `fetchComments` | Most real intent lives in comments, not posts |
+| **Anti-signals** | `lib/scoring/index.ts` | Client-specific noise terms actively downweighted in scoring |
+| **Campaign-level dedup** | `lib/storage/*.ts` → `getSeen`/`addSeen` | Weekly scans don't resurface last week's signals |
+| **Author enrichment** | `lib/sources/*.ts` → `fetchAuthorContext` + scoring | Catches "this author is clearly a journalist not a buyer" |
+| **Reply drafter** | `lib/scoring/index.ts` → `draftReply` | One AI-drafted reply per high-score signal, in client's voice |
+| **HubSpot push** | `lib/integrations/hubspot.ts` | Auto-creates Tasks for signals ≥ threshold |
+
+All controlled per-scan via the **Advanced** section of the form (or via API).
+
+---
+
+## Setup
+
+### 1. Pick your Reddit provider
+
+**Option A — Reddit OAuth (free):**
+1. <https://www.reddit.com/prefs/apps> → "create another app" → type: `script`
+2. Redirect URI: `http://localhost:8080`. Reddit needs it but client_credentials doesn't use it.
+3. Copy client ID (~14 chars) and secret (~27 chars).
+4. ⚠️ If "create app" silently fails → verify your email at <https://www.reddit.com/settings/account>, disable extensions, try incognito. If still blocked, use Option B.
+
+**Option B — Apify (no Reddit setup):**
+Drop your existing `APIFY_TOKEN` into `.env.local`. Done.
+
+### 2. Anthropic key
+
+<https://console.anthropic.com>
+
+### 3. Install
+
+```bash
+cp .env.example .env.local   # fill in keys
+npm install
+npm run dev
 ```
-app/                   Next.js app router
-  page.tsx             Scan creation form (the customer's input)
-  scan/[id]/page.tsx   Live progress + results
-  history/page.tsx     Past scans
-  api/scans/           Create / list / fetch scans
-lib/
-  types.ts             Source-agnostic domain types
-  orchestrator.ts      Runs expansion → fetch → score
-  scoring/index.ts     Claude expansion + scoring (rubric-based)
-  storage/index.ts     Persistence (file-based default; swap for prod)
-  sources/
-    reddit.ts          Reddit OAuth + parallel search
-    twitter.ts         STUB — same Source interface
-    news.ts            STUB
-    instagram.ts       STUB
-    index.ts           Registry
-components/
-  ScanForm.tsx         The 5-section input flow
-  SignalCard.tsx       Result card
+
+<http://localhost:3000>
+
+---
+
+## API surface
+
+### `POST /api/scans`
+
+```jsonc
+{
+  // required
+  "businessDescription": "We sell …",
+  "icp": "B2B SaaS …",
+  "signalTypes": ["pain_point", "buying_intent", "recommendation_request"],
+
+  // optional
+  "keywords": ["..."],            // AI generates if omitted
+  "subreddits": ["..."],          // AI suggests if omitted
+  "antiSignals": ["bookkeeping"], // actively downweighted by scoring
+  "timeWindow": "week",           // hour | day | week | month
+  "maxResults": 25,               // 10 | 25 | 50 | 100
+  "sources": ["reddit"],
+
+  // phase-2 toggles (all default true)
+  "includeComments": true,
+  "enrichAuthors": true,
+  "draftReplies": true,
+
+  // dedup across runs
+  "campaignKey": "osome-singapore",
+
+  // voice for reply drafter
+  "voice": "Conversational, peer-to-peer, never salesy …",
+
+  // HubSpot push (optional)
+  "hubspotToken": "pat-...",
+  "hubspotOwnerId": "12345",
+  "hubspotPushThreshold": 70
+}
 ```
 
-### The `Source` interface
+Returns `{ id }`. Poll `GET /api/scans/{id}` for progress.
 
-Adding a channel means implementing one interface:
+### `GET /api/scans` — list (lite view)
+### `GET /api/scans/{id}` — full scan + signals
+### `DELETE /api/scans/{id}` — remove
+
+---
+
+## Storage
+
+The `Storage` interface in `lib/storage/index.ts` is 6 methods now:
+`list`, `get`, `put`, `delete`, **`getSeen(campaignKey)`**, **`addSeen(campaignKey, ids)`**.
+
+Available implementations:
+- `FileStorage` — local dev (`.data/scans.json` + `.data/seen.json`)
+- `MemoryStorage` — ephemeral fallback for Vercel without external store
+- `AirtableStorage` — production (set `AIRTABLE_API_KEY` + `AIRTABLE_BASE_ID`)
+
+### Airtable schema
+
+Two tables needed:
+
+**`Scans`** (or override via `AIRTABLE_TABLE_NAME`)
+
+| Field | Type |
+| --- | --- |
+| `Scan ID` | Single line text (primary) |
+| `Created At` | Date with time |
+| `Status` | Single select |
+| `Business` | Long text |
+| `Time Window` | Single select |
+| `Signal Count` | Number |
+| `Cost USD` | Number |
+| `Duration s` | Number |
+| `Scan JSON` | Long text |
+
+**`Seen Signals`** (or override via `AIRTABLE_SEEN_TABLE_NAME`)
+
+| Field | Type |
+| --- | --- |
+| `Campaign Key` | Single line text (primary) |
+| `Seen IDs JSON` | Long text |
+| `Updated At` | Date with time |
+
+---
+
+## HubSpot integration
+
+When `hubspotToken` is set on a scan, signals scoring ≥ `hubspotPushThreshold` (default 70) become HubSpot **Tasks**, not Contacts. The reasoning: a Reddit username isn't a verified contact identity, but a Task on the SDR's queue is exactly the action you want.
+
+Each task includes: score, subreddit, signal type, post excerpt, reasoning, suggested action, **the reply draft**, author summary, and the Reddit link. Priority: `HIGH` for score ≥ 85, `MEDIUM` otherwise. Due: 24 hours (Reddit signal decays fast).
+
+Token: HubSpot Private App with scope `crm.objects.tasks.write`. Optional `hubspotOwnerId` assigns the task.
+
+---
+
+## Cost model (per scan, 25 signals)
+
+| Phase | Cost |
+| --- | --- |
+| Reddit (OAuth) | $0 |
+| Reddit (Apify, ~100 raw items) | ~$0.34 |
+| Expansion (Sonnet 4.6) | ~$0.005 |
+| Author summarize (Haiku 4.5) | ~$0.002 |
+| Scoring (Sonnet 4.6, 4–6 batches with comments) | ~$0.05–$0.08 |
+| Reply drafts (Sonnet 4.6, ~10 signals × 600 tok) | ~$0.04 |
+| HubSpot tasks | $0 |
+| **Total per scan** | **~$0.10 (OAuth) / ~$0.44 (Apify)** |
+
+Each scan persists `stats.costUsd`. Switch `MODEL_DRAFT` in `lib/scoring/index.ts` to Haiku 4.5 to drop draft cost ~70%.
+
+---
+
+## Source extension
+
+Adding a channel (X, news, Instagram) means implementing this interface in `lib/sources/{channel}.ts`:
 
 ```ts
 interface Source {
   id: SourceId;
   name: string;
   available: boolean;
-  fetch(params: {
-    keywords: string[];
-    subreddits?: string[];
-    timeWindow: TimeWindow;
-    limit: number;
-  }): Promise<RawPost[]>;
+  fetch(params): Promise<RawPost[]>;
+  fetchComments?(posts, maxPerPost): Promise<RawPost[]>;
+  fetchAuthorContext?(usernames): Promise<Record<string, AuthorContext>>;
 }
 ```
 
-Twitter, news, and Instagram already have stub files. To ship X:
-
-1. Open `lib/sources/twitter.ts`.
-2. Implement `fetch()` against X API v2 or Apify tweet scraper, returning `RawPost[]`.
-3. Flip `available: true`.
-4. Add `"twitter"` checkbox in `ScanForm.tsx`'s sources block.
-
-That's it. The orchestrator, scoring rubric, UI, and history all work unchanged.
-
-### Two-stage accuracy
-
-1. **Source pre-filter** — Reddit's own keyword × subreddit × time filtering narrows aggressively before we spend any AI tokens.
-2. **Claude scoring** — every post graded 0–100 against the customer's business + ICP + chosen signal types, with reasoning and a suggested action. Strict rubric in `lib/scoring/index.ts`.
-
-Default cutoff is score ≥ 20 returned to the UI, with a slider for the customer to raise it.
-
----
-
-## Setup
-
-### 1. Reddit credentials
-
-1. Go to <https://www.reddit.com/prefs/apps>
-2. Click **"are you a developer? create an app..."**
-3. Type: **script**. Name it `Pulse`. Redirect URI: `http://localhost:3000` (unused but required).
-4. Copy the **client ID** (just under "personal use script") and **secret**.
-
-### 2. Anthropic key
-
-Get one at <https://console.anthropic.com>.
-
-### 3. Install
-
-```bash
-cp .env.example .env.local
-# fill in ANTHROPIC_API_KEY, REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET
-npm install
-npm run dev
-```
-
-Open <http://localhost:3000>.
-
----
-
-## Production deployment (Vercel)
-
-This is built for Kunal's stack — drop straight onto Vercel.
-
-```bash
-vercel
-```
-
-Set the env vars in Vercel dashboard (same as `.env.example`).
-
-**One important note about storage:** the default file-based storage in `lib/storage/index.ts` falls back to in-memory on Vercel (it auto-detects `VERCEL=1`). That means scans persist for the function lifetime but won't survive restarts. For real persistence, swap to one of:
-
-- **Vercel KV** — drop-in replacement, ~5 minutes to wire
-- **Airtable** (matches Kunal's stack) — adapter stub-pattern is clear; implement the `Storage` interface against base `appXXX` table `Scans`
-- **Postgres / Supabase** — standard
-
-The `Storage` interface is 4 methods (`list`, `get`, `put`, `delete`). The swap touches one file.
-
----
-
-## Cost model (per scan)
-
-| Component | Cost |
-| --- | --- |
-| Reddit API | $0 (free tier) |
-| Claude expansion call | ~$0.005 |
-| Claude scoring (25 posts ≈ 2 batches) | ~$0.02–$0.04 |
-| **Total per scan** | **~$0.025–$0.045** |
-
-Each scan persists `stats.costUsd` for billing.
-
----
-
-## What's next
-
-- **Phase 2 — X, news, Instagram.** Stubs are in place. ~1 day each to wire.
-- **Phase 2 — comment surfacing.** Reddit search doesn't index comments well. Fetch top comments from matched threads and score them too. ~2× cost, ~3× signal density.
-- **Phase 2 — Apify deep historical.** For "give me everything in the past year" queries beyond Reddit's 1k cap.
-- **Phase 3 — Webhooks / scheduled scans.** Re-run the same scan every Monday at 9am, deliver new signals to Slack.
-- **Phase 3 — Customer accounts + per-account quotas.** Right now anyone hitting the URL can run a scan.
-
----
-
-## Conventions
-
-- All money values in USD, displayed to 3 decimals.
-- All dates ISO 8601 in storage; relative-time in UI.
-- Subreddits stored without `r/` prefix; rendered with it.
-- Source IDs are lowercase: `reddit`, `twitter`, `news`, `instagram`.
-- `signalType` enum lives in `lib/types.ts` — single source of truth.
+Then flip `available: true` and add the source to the registry in `lib/sources/index.ts`. Scoring, drafting, dedup, HubSpot — all unchanged.

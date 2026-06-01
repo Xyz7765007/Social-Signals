@@ -29,11 +29,37 @@ export interface ScanInput {
   businessDescription: string;
   icp: string;
   signalTypes: SignalType[];
-  keywords?: string[];          // optional — AI generates if omitted
-  subreddits?: string[];        // optional — AI suggests if omitted
+  keywords?: string[];
+  subreddits?: string[];
   timeWindow: TimeWindow;
-  maxResults: number;           // 10 | 25 | 50 | 100
-  sources: SourceId[];          // ["reddit"] for now
+  maxResults: number;
+  sources: SourceId[];
+
+  // ─── Phase 2 additions ────────────────────────────────────────────────────
+  /** Terms that look adjacent but aren't real buying signal — scoring prompt
+   *  actively downweights matches mentioning these without intent. */
+  antiSignals?: string[];
+
+  /** When two scans share a campaignKey, the second skips posts/comments that
+   *  earlier scans already surfaced. Enables clean weekly cadence. */
+  campaignKey?: string;
+
+  /** Free-text voice/tone guide used by the reply drafter. */
+  voice?: string;
+
+  /** Generate a reply draft for each high-scoring signal. */
+  draftReplies?: boolean;
+
+  /** Include top comments of matched posts in scoring. */
+  includeComments?: boolean;
+
+  /** Fetch author profile context for each post and use it in scoring. */
+  enrichAuthors?: boolean;
+
+  /** HubSpot push — optional. */
+  hubspotToken?: string;
+  hubspotOwnerId?: string;
+  hubspotPushThreshold?: number; // default 70
 }
 
 export interface RawPost {
@@ -45,22 +71,41 @@ export interface RawPost {
   authorUrl?: string;
   title?: string;
   content: string;
-  createdAt: string;            // ISO
+  createdAt: string;
   metadata: Record<string, any>;
+  /** When true, this RawPost is a comment under another post. */
+  isComment?: boolean;
+}
+
+export interface AuthorContext {
+  username: string;
+  recentPostCount: number;
+  recentSubreddits: string[];
+  summary: string;
+  signalAdjustment: number;
 }
 
 export interface Signal extends RawPost {
-  score: number;                // 0–100
-  reasoning: string;            // why this matches
+  score: number;
+  reasoning: string;
   signalType: SignalType | "other";
-  suggestedAction: string;      // what to do about it
+  suggestedAction: string;
+  replyDraft?: string;
+  authorContext?: AuthorContext;
+  isComment?: boolean;
+  isDuplicate?: boolean;
+  hubspotTaskId?: string;
 }
 
 export type ScanStatus =
   | "queued"
-  | "expanding"      // AI generating keywords/subreddits
-  | "fetching"       // pulling from sources
-  | "scoring"        // Claude scoring
+  | "expanding"
+  | "fetching"
+  | "fetching_comments"
+  | "enriching"
+  | "scoring"
+  | "drafting"
+  | "pushing"
   | "complete"
   | "failed";
 
@@ -86,10 +131,14 @@ export interface Scan {
   error?: string;
   stats?: {
     rawCount: number;
+    postCount: number;
+    commentCount: number;
     dedupedCount: number;
     scoredCount: number;
+    duplicateCount: number;
     durationMs: number;
     costUsd: number;
+    hubspotTasksCreated: number;
   };
 }
 
@@ -103,4 +152,6 @@ export interface Source {
     timeWindow: TimeWindow;
     limit: number;
   }): Promise<RawPost[]>;
+  fetchComments?(posts: RawPost[], maxPerPost: number): Promise<RawPost[]>;
+  fetchAuthorContext?(usernames: string[]): Promise<Record<string, AuthorContext>>;
 }
