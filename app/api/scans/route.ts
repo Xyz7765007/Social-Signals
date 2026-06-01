@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { waitUntil } from "@vercel/functions";
 import { storage } from "@/lib/storage";
 import { createScan, runScan } from "@/lib/orchestrator";
 import type { ScanInput, SignalType } from "@/lib/types";
@@ -60,7 +61,14 @@ export async function POST(req: NextRequest) {
   try {
     const scan = createScan(v);
     await storage.put(scan);
-    runScan(scan.id).catch((err) => console.error("Scan failed", scan.id, err));
+    // CRITICAL: on Vercel, returning the response kills the function. Without
+    // waitUntil(), the runScan() promise gets orphaned and the scan stays in
+    // "queued" forever. waitUntil tells Vercel to keep the function alive
+    // (up to maxDuration=300) until the scan finishes, while still responding
+    // to the client immediately. No-op outside Vercel — local dev relies on
+    // the Node process staying alive between requests, which it does.
+    const task = runScan(scan.id).catch((err) => console.error("Scan failed", scan.id, err));
+    waitUntil(task);
     return NextResponse.json({ id: scan.id }, { status: 201 });
   } catch (e: any) {
     console.error("POST /api/scans failed:", e);
