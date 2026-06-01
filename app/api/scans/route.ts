@@ -57,24 +57,39 @@ export async function POST(req: NextRequest) {
   const v = validate(body);
   if ("error" in v) return NextResponse.json({ error: v.error }, { status: 400 });
 
-  const scan = createScan(v);
-  await storage.put(scan);
-  runScan(scan.id).catch((err) => console.error("Scan failed", scan.id, err));
-
-  return NextResponse.json({ id: scan.id }, { status: 201 });
+  try {
+    const scan = createScan(v);
+    await storage.put(scan);
+    runScan(scan.id).catch((err) => console.error("Scan failed", scan.id, err));
+    return NextResponse.json({ id: scan.id }, { status: 201 });
+  } catch (e: any) {
+    console.error("POST /api/scans failed:", e);
+    return NextResponse.json(
+      { error: `Could not create scan: ${e?.message ?? "unknown"}` },
+      { status: 500 },
+    );
+  }
 }
 
 export async function GET() {
-  const scans = await storage.list();
-  const lite = scans.map((s) => ({
-    id: s.id,
-    createdAt: s.createdAt,
-    status: s.progress.status,
-    message: s.progress.message,
-    businessDescription: s.input.businessDescription.slice(0, 120),
-    campaignKey: s.input.campaignKey,
-    timeWindow: s.input.timeWindow,
-    signalCount: s.signals.length,
-  }));
-  return NextResponse.json({ scans: lite });
+  try {
+    const scans = await storage.list();
+    const lite = scans.map((s) => ({
+      id: s.id,
+      createdAt: s.createdAt,
+      status: s.progress.status,
+      message: s.progress.message,
+      businessDescription: s.input.businessDescription.slice(0, 120),
+      campaignKey: s.input.campaignKey,
+      timeWindow: s.input.timeWindow,
+      signalCount: s.signals.length,
+    }));
+    return NextResponse.json({ scans: lite });
+  } catch (e: any) {
+    console.error("GET /api/scans failed:", e);
+    return NextResponse.json(
+      { error: `Storage error: ${e?.message ?? "unknown"}` },
+      { status: 500 },
+    );
+  }
 }

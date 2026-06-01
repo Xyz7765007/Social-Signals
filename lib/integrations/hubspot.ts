@@ -11,6 +11,7 @@
  */
 
 import type { Signal } from "../types";
+import { fetchWithRetry } from "../fetch-retry";
 
 const HUBSPOT_API = "https://api.hubapi.com";
 
@@ -63,17 +64,20 @@ async function createTask(sig: Signal, token: string, ownerId?: string): Promise
   };
   if (ownerId) properties.hubspot_owner_id = ownerId;
 
-  const res = await fetch(`${HUBSPOT_API}/crm/v3/objects/tasks`, {
+  const res = await fetchWithRetry(`${HUBSPOT_API}/crm/v3/objects/tasks`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ properties }),
-  });
+  }, { label: "hubspot task", timeoutMs: 20_000 });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    // Surface the most common errors with actionable messages
+    if (res.status === 401) throw new Error(`HubSpot 401: token invalid or expired`);
+    if (res.status === 403) throw new Error(`HubSpot 403: token missing crm.objects.tasks.write scope`);
     throw new Error(`HubSpot task create failed: ${res.status} ${text.slice(0, 200)}`);
   }
   const data: any = await res.json();

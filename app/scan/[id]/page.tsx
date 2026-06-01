@@ -21,29 +21,52 @@ export default function ScanPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let consecutiveFailures = 0;
+    const MAX_TRANSIENT_FAILURES = 5;
+
     async function tick() {
+      if (cancelled) return;
       try {
-        const res = await fetch(`/api/scans/${id}`);
-        if (!res.ok) {
-          if (res.status === 404) throw new Error("Scan not found");
-          throw new Error("Failed to load scan");
+        const res = await fetch(`/api/scans/${id}`, { cache: "no-store" });
+
+        if (res.status === 404) {
+          // 404 is terminal — scan was deleted or never existed.
+          setError("Scan not found. It may have been deleted.");
+          return;
         }
+
+        if (!res.ok) {
+          // Other non-OK = transient. Back off briefly and retry.
+          consecutiveFailures++;
+          if (consecutiveFailures >= MAX_TRANSIENT_FAILURES) {
+            setError(`Lost connection to server (${res.status}). Reload to try again.`);
+            return;
+          }
+          setTimeout(tick, Math.min(POLL_INTERVAL * (consecutiveFailures + 1), 10_000));
+          return;
+        }
+
         const data: Scan = await res.json();
         if (cancelled) return;
+        consecutiveFailures = 0;
         setScan(data);
-        if (data.progress.status === "complete" || data.progress.status === "failed") {
-          return; // stop polling
-        }
+        setError(null);
+
+        if (data.progress.status === "complete" || data.progress.status === "failed") return;
         setTimeout(tick, POLL_INTERVAL);
       } catch (e: any) {
         if (cancelled) return;
-        setError(e?.message ?? "Failed to load");
+        // Network error / offline — treat as transient.
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_TRANSIENT_FAILURES) {
+          setError("Lost connection to server. Reload to try again.");
+          return;
+        }
+        setTimeout(tick, Math.min(POLL_INTERVAL * (consecutiveFailures + 1), 10_000));
       }
     }
     tick();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, [id]);
 
   const filtered = useMemo(() => {
@@ -173,6 +196,24 @@ export default function ScanPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Warnings (non-fatal) */}
+      {scan.warnings && scan.warnings.length > 0 && (
+        <details className="card p-4 mb-8 border-[var(--amber)]/30">
+          <summary className="cursor-pointer flex items-center gap-2 text-sm">
+            <AlertCircle size={14} className="text-[var(--amber)]" />
+            <span className="text-[11px] font-mono uppercase tracking-[0.18em] text-[var(--amber)]">
+              {scan.warnings.length} warning{scan.warnings.length === 1 ? "" : "s"}
+            </span>
+            <span className="text-[12px] text-[var(--text-dim)]">— scan completed but some steps had issues</span>
+          </summary>
+          <ul className="mt-3 space-y-1.5 text-[13px] text-[var(--text-dim)] font-mono">
+            {scan.warnings.map((w, i) => (
+              <li key={i} className="flex gap-2"><span className="text-[var(--text-faint)]">·</span>{w}</li>
+            ))}
+          </ul>
+        </details>
       )}
 
       {/* Results */}

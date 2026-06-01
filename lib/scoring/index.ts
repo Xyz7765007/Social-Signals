@@ -204,7 +204,7 @@ Return ONLY valid JSON:
 // 3) SCORING
 // ───────────────────────────────────────────────────────────────────────────
 
-export interface ScoringResult { signals: Signal[]; costUsd: number; }
+export interface ScoringResult { signals: Signal[]; costUsd: number; warnings: string[]; }
 interface ScoredItem {
   index: number; score: number; signalType: SignalType | "other";
   reasoning: string; suggestedAction: string;
@@ -216,16 +216,24 @@ export async function scorePosts(
   authors: Record<string, AuthorContext>,
   onBatch?: (done: number) => void,
 ): Promise<ScoringResult> {
-  if (posts.length === 0) return { signals: [], costUsd: 0 };
+  if (posts.length === 0) return { signals: [], costUsd: 0, warnings: [] };
 
   const batches = chunk(posts, SCORING_BATCH_SIZE);
   const allScored: ScoredItem[] = [];
+  const warnings: string[] = [];
   let cost = 0;
   let done = 0;
-  for (const batch of batches) {
-    const { scored, costUsd } = await scoreBatch(input, batch, done, authors);
-    allScored.push(...scored);
-    cost += costUsd;
+  for (let i = 0; i < batches.length; i++) {
+    const batch = batches[i];
+    try {
+      const { scored, costUsd } = await scoreBatch(input, batch, done, authors);
+      allScored.push(...scored);
+      cost += costUsd;
+    } catch (e: any) {
+      // One bad batch shouldn't kill the whole scan. Log and continue —
+      // those items just won't appear in the results.
+      warnings.push(`Scoring batch ${i + 1}/${batches.length} failed (${batch.length} items skipped): ${e?.message ?? e}`);
+    }
     done += batch.length;
     onBatch?.(done);
   }
@@ -250,7 +258,7 @@ export async function scorePosts(
     .filter((s) => s.score >= 20)
     .sort((a, b) => b.score - a.score);
 
-  return { signals, costUsd: cost };
+  return { signals, costUsd: cost, warnings };
 }
 
 async function scoreBatch(
@@ -337,10 +345,14 @@ Return ONLY valid JSON, an array with one object per post in the same order, usi
   if (!Array.isArray(parsed)) throw new Error("Scoring response was not an array");
 
   const scored: ScoredItem[] = parsed
-    .filter((x: any) => typeof x?.index === "number")
+    .filter((x: any) => typeof x?.index === "number" && Number.isFinite(x.index))
+    .filter((x: any) => x.index >= offset && x.index < offset + batch.length)
     .map((x: any) => ({
       index: x.index,
-      score: typeof x.score === "number" ? x.score : 0,
+      // Clamp score in case model returns out-of-range. The author-adjustment
+      // step clamps again, but doing it here means a bad raw score (-50, 150)
+      // can't poison the downstream sort.
+      score: clamp(typeof x.score === "number" && Number.isFinite(x.score) ? x.score : 0, 0, 100),
       signalType: isSignalType(x.signalType) ? x.signalType : "other",
       reasoning: String(x.reasoning ?? "").slice(0, 400),
       suggestedAction: String(x.suggestedAction ?? "").slice(0, 300),

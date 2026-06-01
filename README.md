@@ -132,31 +132,47 @@ Available implementations:
 - `MemoryStorage` — ephemeral fallback for Vercel without external store
 - `AirtableStorage` — production (set `AIRTABLE_API_KEY` + `AIRTABLE_BASE_ID`)
 
-### Airtable schema
+### Airtable schema (auto-created)
 
-Two tables needed:
+Pulse auto-bootstraps the schema on first use. It calls Airtable's Metadata API to:
+- Create the `Scans` and `Seen Signals` tables if they don't exist
+- Add any missing fields if the tables exist with an older shape
+- Add any missing single-select options (e.g. when new pipeline statuses ship)
+- Never delete, rename, or change the type of existing fields
 
-**`Scans`** (or override via `AIRTABLE_TABLE_NAME`)
+PAT scopes required (`https://airtable.com/create/tokens`):
+- `data.records:read`
+- `data.records:write`
+- `schema.bases:read` — to detect what already exists
+- `schema.bases:write` — to create / extend tables (only used during first init)
+
+To verify schema sync without running a scan, hit `GET /api/setup` after deploy. Returns `{ok: true, storage, base, scansTable, seenTable}` on success, `{ok: false, error}` with a precise fix on failure.
+
+If you can't grant `schema.bases:write` (e.g. enterprise base where the PAT can only have read scope), the error message lists the exact schema to create manually — fields, types, and single-select options.
+
+**Schema reference (what gets created):**
+
+`Scans` table:
 
 | Field | Type |
 | --- | --- |
 | `Scan ID` | Single line text (primary) |
-| `Created At` | Date with time |
-| `Status` | Single select |
+| `Created At` | Date with time (UTC, ISO) |
+| `Status` | Single select: queued · expanding · fetching · fetching_comments · enriching · scoring · drafting · pushing · complete · failed |
 | `Business` | Long text |
-| `Time Window` | Single select |
-| `Signal Count` | Number |
-| `Cost USD` | Number |
-| `Duration s` | Number |
+| `Time Window` | Single select: hour · day · week · month |
+| `Signal Count` | Number (integer) |
+| `Cost USD` | Number (4 decimals) |
+| `Duration s` | Number (1 decimal) |
 | `Scan JSON` | Long text |
 
-**`Seen Signals`** (or override via `AIRTABLE_SEEN_TABLE_NAME`)
+`Seen Signals` table:
 
 | Field | Type |
 | --- | --- |
 | `Campaign Key` | Single line text (primary) |
 | `Seen IDs JSON` | Long text |
-| `Updated At` | Date with time |
+| `Updated At` | Date with time (UTC, ISO) |
 
 ---
 

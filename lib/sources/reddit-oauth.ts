@@ -9,6 +9,7 @@
  */
 
 import type { AuthorContext, RawPost, Source, TimeWindow } from "../types";
+import { fetchWithRetry } from "../fetch-retry";
 
 const TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
 const API_BASE = "https://oauth.reddit.com";
@@ -29,7 +30,7 @@ async function getToken(): Promise<string> {
   }
 
   const basic = Buffer.from(`${id}:${secret}`).toString("base64");
-  const res = await fetch(TOKEN_URL, {
+  const res = await fetchWithRetry(TOKEN_URL, {
     method: "POST",
     headers: {
       Authorization: `Basic ${basic}`,
@@ -37,7 +38,7 @@ async function getToken(): Promise<string> {
       "User-Agent": process.env.REDDIT_USER_AGENT ?? "Pulse/1.0",
     },
     body: "grant_type=client_credentials",
-  });
+  }, { label: "reddit token", timeoutMs: 15_000 });
   if (!res.ok) throw new Error(`Reddit token request failed: ${res.status} ${await res.text()}`);
   const json: any = await res.json();
   setCache({ token: json.access_token, expiresAt: Date.now() + (json.expires_in ?? 3600) * 1000 });
@@ -61,7 +62,7 @@ async function searchOne(opts: {
   const url = subreddit
     ? `${API_BASE}/r/${subreddit}/search?${params}`
     : `${API_BASE}/search?${params}`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": ua() } });
+  const res = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": ua() } }, { label: "reddit api", timeoutMs: 20_000 });
   if (!res.ok) return [];
   const data: any = await res.json();
   const children: any[] = data?.data?.children ?? [];
@@ -105,7 +106,7 @@ async function fetchTopComments(token: string, post: RawPost, maxPerPost: number
   // Drop t3_ prefix from name to get bare ID for the comments endpoint
   const postId = post.externalId.replace(/^t3_/, "");
   const url = `${API_BASE}/comments/${postId}?sort=top&limit=${Math.min(maxPerPost + 2, 10)}&depth=1&raw_json=1`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": ua() } });
+  const res = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": ua() } }, { label: "reddit api", timeoutMs: 20_000 });
   if (!res.ok) return [];
   const data: any = await res.json();
   // Reddit returns [post, comments] — comments live at index 1
@@ -149,7 +150,7 @@ async function fetchTopComments(token: string, post: RawPost, maxPerPost: number
 async function fetchAuthorRecent(token: string, username: string): Promise<AuthorContext | null> {
   if (!username || username === "[deleted]" || username === "AutoModerator") return null;
   const url = `${API_BASE}/user/${encodeURIComponent(username)}/submitted?limit=10&sort=new&raw_json=1`;
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": ua() } });
+  const res = await fetchWithRetry(url, { headers: { Authorization: `Bearer ${token}`, "User-Agent": ua() } }, { label: "reddit api", timeoutMs: 20_000 });
   if (!res.ok) return null;
   const data: any = await res.json();
   const items: any[] = data?.data?.children ?? [];

@@ -10,6 +10,7 @@
  */
 
 import type { AuthorContext, RawPost, Source, TimeWindow } from "../types";
+import { fetchWithRetry } from "../fetch-retry";
 
 const APIFY_API = "https://api.apify.com/v2";
 const DEFAULT_ACTOR = "trudax~reddit-scraper-lite";
@@ -30,11 +31,11 @@ interface ApifyItem {
 
 async function runActor(actorId: string, token: string, input: any): Promise<ApifyItem[]> {
   const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=300`;
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-  });
+  }, { label: `apify ${actorId}`, timeoutMs: 330_000, retries: 1 });
   if (!res.ok) throw new Error(`Apify run failed: ${res.status} ${await res.text().catch(() => "")}`);
   return await res.json();
 }
@@ -194,9 +195,9 @@ export const redditApifySource: Source = {
     const out: Record<string, AuthorContext> = {};
     const tasks = unique.map(async (u) => {
       try {
-        const res = await fetch(`https://www.reddit.com/user/${encodeURIComponent(u)}/submitted.json?limit=10&sort=new`, {
+        const res = await fetchWithRetry(`https://www.reddit.com/user/${encodeURIComponent(u)}/submitted.json?limit=10&sort=new`, {
           headers: { "User-Agent": process.env.REDDIT_USER_AGENT ?? "Pulse/1.0" },
-        });
+        }, { label: "reddit user profile", timeoutMs: 15_000, retries: 1 });
         if (!res.ok) return;
         const data: any = await res.json();
         const items: any[] = data?.data?.children ?? [];

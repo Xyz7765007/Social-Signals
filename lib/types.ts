@@ -120,6 +120,8 @@ export interface ScanProgress {
 export interface Scan {
   id: string;
   createdAt: string;
+  /** Updated on every progress write. Lets the UI detect stalled scans. */
+  updatedAt: string;
   input: ScanInput;
   expansion?: {
     keywords: string[];
@@ -128,7 +130,12 @@ export interface Scan {
   };
   progress: ScanProgress;
   signals: Signal[];
+  /** Fatal error message — set when status === "failed". */
   error?: string;
+  /** Non-fatal warnings collected during the scan (rate limits, partial
+   *  failures, HubSpot push errors, etc). The scan can still complete with
+   *  warnings — they're surfaced to the user but don't block. */
+  warnings?: string[];
   stats?: {
     rawCount: number;
     postCount: number;
