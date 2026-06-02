@@ -160,8 +160,25 @@ function mapComment(it: ApifyItem, parents: Map<string, RawPost>): RawPost | nul
 function buildSearchUrls(opts: { keywords: string[]; subreddits?: string[]; timeWindow: TimeWindow }) {
   const { keywords, subreddits, timeWindow } = opts;
   const urls: { url: string; method: "GET" }[] = [];
-  if (subreddits && subreddits.length > 0) {
-    for (const sub of subreddits) for (const kw of keywords) {
+
+  // No subreddits → cross-Reddit search per keyword (one URL per keyword).
+  if (!subreddits || subreddits.length === 0) {
+    for (const kw of keywords) {
+      urls.push({
+        url: `https://www.reddit.com/search/?q=${encodeURIComponent(kw)}&sort=new&t=${timeWindow}`,
+        method: "GET",
+      });
+    }
+    return urls;
+  }
+
+  // KEYWORD-FIRST iteration: emit (keyword 1 × every sub) before moving to
+  // (keyword 2 × every sub). Critical when the array gets sliced downstream
+  // — slicing sub-first would cover one sub deeply and miss the rest entirely.
+  // Keyword-first guarantees broad keyword + broad subreddit coverage even
+  // when we slice to ~32 URLs.
+  for (const kw of keywords) {
+    for (const sub of subreddits) {
       urls.push({
         url: `https://www.reddit.com/r/${sub}/search/?q=${encodeURIComponent(kw)}&restrict_sr=1&sort=new&t=${timeWindow}`,
         method: "GET",
@@ -187,10 +204,11 @@ export const redditApifySource: Source = {
     // limit=100 → 200 (the ceiling).
     const targetTotal = Math.min(Math.max(limit * 3, 30), HARD_FETCH_CAP);
 
-    // Reduce the number of startUrls we hand the actor. trudax's actor can
-    // interpret per-URL caps loosely; fewer search URLs = tighter total
-    // bound. 12 is enough breadth (~3-4 subs × 3-4 keywords each pre-cross).
-    const startUrls = buildSearchUrls({ keywords, subreddits, timeWindow }).slice(0, 12);
+    // Reduce the number of startUrls we hand the actor. With keyword-first
+    // iteration in buildSearchUrls, 32 URLs covers ~4 keywords × 8 subreddits
+    // — broad enough to find signal, narrow enough that maxItems caps cost.
+    // The HARD_FETCH_CAP slice at the end of fetch() is the real safety net.
+    const startUrls = buildSearchUrls({ keywords, subreddits, timeWindow }).slice(0, 32);
 
     // Per-community cap. Keep below targetTotal so no single sub can consume
     // the whole budget.
