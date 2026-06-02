@@ -197,6 +197,9 @@ export default function ScanForm() {
                   </button>
                 ))}
               </div>
+              <p className="text-xs text-[var(--text-faint)] mt-2">
+                Pulse fetches up to 200 raw posts from Reddit, ranks them, and returns the top {maxResults} signals scoring ≥ 20. Bounds worst-case Apify cost at ~$0.60/scan.
+              </p>
             </div>
           </div>
         </Section>

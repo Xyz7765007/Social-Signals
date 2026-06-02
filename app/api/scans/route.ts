@@ -91,6 +91,10 @@ export async function GET() {
       campaignKey: s.input.campaignKey,
       timeWindow: s.input.timeWindow,
       signalCount: s.signals.length,
+      // Cost data — undefined for old scans pre-tracking
+      costUsd: s.stats?.costUsd,
+      costs: s.stats?.costs,
+      durationMs: s.stats?.durationMs,
     }));
     return NextResponse.json({ scans: lite });
   } catch (e: any) {

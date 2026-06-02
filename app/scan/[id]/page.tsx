@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
-import { ArrowLeft, RefreshCw, AlertCircle, Filter, Loader2 } from "lucide-react";
+import { useParams, useRouter } from "next/navigation";
+import { ArrowLeft, RefreshCw, AlertCircle, Filter, Loader2, Trash2 } from "lucide-react";
 import type { Scan, SignalType } from "@/lib/types";
 import { SIGNAL_TYPE_LABELS, SIGNAL_TYPES } from "@/lib/types";
 import SignalCard from "@/components/SignalCard";
@@ -12,12 +12,34 @@ const POLL_INTERVAL = 2000;
 
 export default function ScanPage() {
   const { id } = useParams<{ id: string }>();
+  const router = useRouter();
   const [scan, setScan] = useState<Scan | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   // filter state
   const [minScore, setMinScore] = useState<number>(50);
   const [typeFilter, setTypeFilter] = useState<Set<SignalType | "other">>(new Set());
+
+  async function handleDelete() {
+    if (deleting) return;
+    const confirmed = window.confirm(
+      "Delete this scan? This removes it from storage permanently."
+    );
+    if (!confirmed) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/scans/${id}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 404) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? `Delete failed (${res.status})`);
+      }
+      router.push("/history");
+    } catch (e: any) {
+      setError(e?.message ?? "Couldn't delete");
+      setDeleting(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -105,12 +127,26 @@ export default function ScanPage() {
     <div className="max-w-4xl mx-auto px-6 pt-10 pb-20">
       {/* Header */}
       <div className="mb-8">
-        <Link
-          href="/"
-          className="text-[11px] font-mono uppercase tracking-[0.2em] text-[var(--text-faint)] hover:text-[var(--text-dim)] inline-flex items-center gap-1.5 mb-5"
-        >
-          <ArrowLeft size={12} /> New scan
-        </Link>
+        <div className="flex items-center justify-between mb-5">
+          <Link
+            href="/"
+            className="text-[11px] font-mono uppercase tracking-[0.2em] text-[var(--text-faint)] hover:text-[var(--text-dim)] inline-flex items-center gap-1.5"
+          >
+            <ArrowLeft size={12} /> New scan
+          </Link>
+          <button
+            onClick={handleDelete}
+            disabled={deleting}
+            className="text-[11px] font-mono uppercase tracking-[0.2em] text-[var(--text-faint)] hover:text-[var(--ember)] inline-flex items-center gap-1.5 transition-colors disabled:opacity-50"
+            title="Delete this scan"
+          >
+            {deleting ? (
+              <><Loader2 size={12} className="animate-spin" /> Deleting…</>
+            ) : (
+              <><Trash2 size={12} /> Delete</>
+            )}
+          </button>
+        </div>
         <h1 className="font-display text-4xl sm:text-5xl tracking-tightest leading-[1.05] mb-3">
           {inProgress ? "Scanning…" : scan.progress.status === "failed" ? "Scan failed" : "Signal report"}
         </h1>

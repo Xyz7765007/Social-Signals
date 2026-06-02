@@ -1,19 +1,37 @@
 /**
  * Reddit source — Apify implementation.
  *
- * Used when REDDIT_PROVIDER=apify or as fallback when OAuth credentials are
- * absent. Actor: trudax/reddit-scraper-lite (~$3.40 per 1k results).
+ * Cost tracking: after each actor run, we read `X-Apify-Run-Id` from the
+ * response header and GET the run object to retrieve `usageTotalUsd` —
+ * Apify's authoritative billed cost. This is the ground truth, not an estimate.
  *
- * Phase 2: fetchComments() runs the same actor against startUrls scoped to
- * each matched post, with type=comments. Author context isn't easy via Apify
- * cheaply, so we fall back to /user/{u}.json (public, unauthenticated).
+ * Actor: trudax/reddit-scraper-lite (~$3.40 per 1k results in practice, but
+ * actual price varies by compute units and dataset writes — read it from
+ * Apify rather than estimating).
  */
 
-import type { AuthorContext, RawPost, Source, TimeWindow } from "../types";
+import type {
+  AuthorContext, RawPost, Source, SourceAuthorContextResult,
+  SourceFetchResult, TimeWindow,
+} from "../types";
 import { fetchWithRetry } from "../fetch-retry";
 
 const APIFY_API = "https://api.apify.com/v2";
 const DEFAULT_ACTOR = "trudax~reddit-scraper-lite";
+
+/**
+ * Hard ceiling on raw posts fetched per scan.
+ *
+ * Apify bills per result. Without this cap, a scan with 12 keywords × 7
+ * subreddits = 84 combinations can run away into thousands of posts —
+ * burning credits and producing noisy data we then have to dedup + score.
+ *
+ * 200 is enough for good dedup + scoring filtering on a maxResults=100 scan,
+ * and bounds worst-case cost at ~$0.60/scan on the Apify Reddit actor.
+ *
+ * Comments use a separate, smaller cap (15 posts × 3 comments = 45 max).
+ */
+const HARD_FETCH_CAP = 200;
 
 interface ApifyItem {
   id?: string; parsedId?: string; url?: string;
@@ -29,7 +47,12 @@ interface ApifyItem {
   parentPostId?: string;
 }
 
-async function runActor(actorId: string, token: string, input: any): Promise<ApifyItem[]> {
+interface ActorRunResult {
+  items: ApifyItem[];
+  costUsd: number;
+}
+
+async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
   const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=300`;
   const res = await fetchWithRetry(url, {
     method: "POST",
@@ -37,7 +60,35 @@ async function runActor(actorId: string, token: string, input: any): Promise<Api
     body: JSON.stringify(input),
   }, { label: `apify ${actorId}`, timeoutMs: 330_000, retries: 1 });
   if (!res.ok) throw new Error(`Apify run failed: ${res.status} ${await res.text().catch(() => "")}`);
-  return await res.json();
+
+  // The run ID lets us look up the actual billed cost.
+  const runId = res.headers.get("X-Apify-Run-Id") ?? res.headers.get("x-apify-run-id");
+  const items: ApifyItem[] = await res.json();
+
+  // Cost lookup is best-effort — never fail the scan if Apify's cost API is
+  // slow or unavailable. We just report 0 in that case.
+  let costUsd = 0;
+  if (runId) {
+    try {
+      const runRes = await fetchWithRetry(
+        `${APIFY_API}/actor-runs/${runId}?token=${token}`,
+        {},
+        { label: "apify run cost", timeoutMs: 15_000, retries: 1 },
+      );
+      if (runRes.ok) {
+        const data: any = await runRes.json();
+        // Apify's run object: data.data.usageTotalUsd
+        const reported = Number(data?.data?.usageTotalUsd ?? 0);
+        if (Number.isFinite(reported) && reported >= 0) {
+          costUsd = reported;
+        }
+      }
+    } catch (e) {
+      console.warn("Apify cost lookup failed (continuing with cost=0):", e);
+    }
+  }
+
+  return { items, costUsd };
 }
 
 function mapPost(it: ApifyItem): RawPost | null {
@@ -125,23 +176,41 @@ export const redditApifySource: Source = {
   name: "Reddit (Apify)",
   available: Boolean(process.env.APIFY_TOKEN),
 
-  async fetch({ keywords, subreddits, timeWindow, limit }) {
-    if (keywords.length === 0) return [];
+  async fetch({ keywords, subreddits, timeWindow, limit }): Promise<SourceFetchResult> {
+    if (keywords.length === 0) return { items: [], costUsd: 0 };
     const token = process.env.APIFY_TOKEN!;
     const actorId = process.env.APIFY_REDDIT_ACTOR_ID ?? DEFAULT_ACTOR;
-    const startUrls = buildSearchUrls({ keywords, subreddits, timeWindow }).slice(0, 40);
-    const items = await runActor(actorId, token, {
+
+    // Strict cap on what we ask Apify to return. Use min() not max() —
+    // the bug we hit before was using Math.max which never went below 60.
+    // Cap target = min(limit * 3, HARD_FETCH_CAP). For limit=25 → 75. For
+    // limit=100 → 200 (the ceiling).
+    const targetTotal = Math.min(Math.max(limit * 3, 30), HARD_FETCH_CAP);
+
+    // Reduce the number of startUrls we hand the actor. trudax's actor can
+    // interpret per-URL caps loosely; fewer search URLs = tighter total
+    // bound. 12 is enough breadth (~3-4 subs × 3-4 keywords each pre-cross).
+    const startUrls = buildSearchUrls({ keywords, subreddits, timeWindow }).slice(0, 12);
+
+    // Per-community cap. Keep below targetTotal so no single sub can consume
+    // the whole budget.
+    const perCommunityCap = Math.max(10, Math.ceil(targetTotal / Math.max(1, startUrls.length || 1)));
+
+    const { items, costUsd } = await runActor(actorId, token, {
       startUrls,
-      searches: keywords.slice(0, 8),
+      // Drop the `searches` param — we already have startUrls covering
+      // every keyword × subreddit combination we care about. Passing both
+      // doubles the fetch.
       type: "posts",
       sort: "new",
       time: timeWindow,
-      maxItems: Math.max(limit * 3, 60),
-      maxPostCount: Math.max(limit * 3, 60),
+      maxItems: targetTotal,
+      maxPostCount: perCommunityCap,
       maxComments: 0,
       maxCommunitiesAndUsers: 0,
       proxy: { useApifyProxy: true },
     });
+
     const raw = items
       .filter((it) => !it.over18 && !it.isAd && (!it.dataType || it.dataType === "post"))
       .map(mapPost)
@@ -158,21 +227,21 @@ export const redditApifySource: Source = {
       if (t !== 0) return t;
       return (b.metadata.upvotes ?? 0) - (a.metadata.upvotes ?? 0);
     });
-    return deduped.slice(0, Math.max(limit * 3, 30));
+    // Final defense — even if Apify ignored our caps, slice to HARD_FETCH_CAP.
+    return { items: deduped.slice(0, HARD_FETCH_CAP), costUsd };
   },
 
-  async fetchComments(posts, maxPerPost) {
-    if (posts.length === 0) return [];
+  async fetchComments(posts, maxPerPost): Promise<SourceFetchResult> {
+    if (posts.length === 0) return { items: [], costUsd: 0 };
     const token = process.env.APIFY_TOKEN!;
     const actorId = process.env.APIFY_REDDIT_ACTOR_ID ?? DEFAULT_ACTOR;
-    // Only pull for high-engagement posts to control cost
     const candidates = posts
       .filter((p) => !p.isComment)
       .filter((p) => (p.metadata.comments ?? 0) >= 2 || (p.metadata.upvotes ?? 0) >= 3)
       .slice(0, 15);
-    if (candidates.length === 0) return [];
+    if (candidates.length === 0) return { items: [], costUsd: 0 };
     const parents = new Map(candidates.map((p) => [p.externalId, p]));
-    const items = await runActor(actorId, token, {
+    const { items, costUsd } = await runActor(actorId, token, {
       startUrls: candidates.map((p) => ({ url: p.url, method: "GET" as const })),
       type: "comments",
       sort: "top",
@@ -182,15 +251,16 @@ export const redditApifySource: Source = {
       maxCommunitiesAndUsers: 0,
       proxy: { useApifyProxy: true },
     });
-    return items
+    const comments = items
       .filter((it) => !it.over18 && (!it.dataType || it.dataType === "comment"))
       .map((it) => mapComment(it, parents))
       .filter((c): c is RawPost => c !== null);
+    return { items: comments, costUsd };
   },
 
-  async fetchAuthorContext(usernames) {
-    // Use public Reddit JSON for author profile — cheaper than spinning Apify
-    // for tiny per-user pulls. Unauthenticated, lower limits but read-only & low risk.
+  async fetchAuthorContext(usernames): Promise<SourceAuthorContextResult> {
+    // Use unauthenticated Reddit JSON for author profile — Apify would cost
+    // way more for tiny per-user pulls and this is read-only low-risk data.
     const unique = Array.from(new Set(usernames.filter((u) => u && u !== "[deleted]" && u !== "[unknown]"))).slice(0, 30);
     const out: Record<string, AuthorContext> = {};
     const tasks = unique.map(async (u) => {
@@ -212,10 +282,9 @@ export const redditApifySource: Source = {
         };
       } catch {}
     });
-    // chunked to ~10 parallel to keep IP polite
     for (let i = 0; i < tasks.length; i += 10) {
       await Promise.all(tasks.slice(i, i + 10));
     }
-    return out;
+    return { contexts: out, costUsd: 0 };
   },
 };

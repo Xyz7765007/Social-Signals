@@ -1,25 +1,15 @@
 /**
- * Scan orchestrator.
+ * Scan orchestrator with per-phase cost tracking.
  *
- * Pipeline:
- *   1. expanding         AI generates keywords + subreddits
- *   2. fetching          Sources pull posts
- *   3. fetching_comments (opt) pulls top comments for engaged posts
- *   4. dedup_seen        skip externalIds already seen on this campaign
- *   5. enriching         (opt) fetch + Claude-summarize author profiles
- *   6. scoring           Claude scores each item with anti-signals + author ctx
- *   7. drafting          (opt) reply drafts for signals ≥ 60
- *   8. pushing           (opt) HubSpot tasks for signals ≥ threshold
- *   9. complete
- *
- * Resilience model:
- *  - Each phase updates progress + scan.updatedAt so the UI can detect stalls
- *  - Non-fatal failures (one comment-fetch source down, one scoring batch
- *    malformed, HubSpot rate-limited) collect into scan.warnings; the scan
- *    keeps going with whatever it did get
- *  - Fatal failures (Anthropic auth, source unavailable, storage down) set
- *    scan.error and status=failed. The catch block's persist attempt is
- *    itself wrapped so a storage outage doesn't shadow the original error.
+ * Cost accounting strategy:
+ *  - Each AI call (expansion, scoring, drafting, author summary) returns
+ *    its own costUsd. The orchestrator tracks these in `costs.<phase>`.
+ *  - Each source call (Apify fetch, comments) returns its own costUsd.
+ *    These accumulate into `costs.apify`.
+ *  - Free providers (Reddit OAuth, stubs) return 0 — they're invisible in
+ *    the cost view, which is correct.
+ *  - `stats.costUsd` stays as the grand total for backward compat with the
+ *    UI and any external consumers. The breakdown is in `stats.costs`.
  */
 
 import { randomUUID } from "crypto";
@@ -28,8 +18,15 @@ import { storage } from "./storage";
 import { expandScanInput, scorePosts, summarizeAuthors, draftRepliesForSignals } from "./scoring";
 import { pushSignalsToHubspot } from "./integrations/hubspot";
 import type {
-  AuthorContext, RawPost, Scan, ScanInput, ScanProgress, Signal, SourceId,
+  AuthorContext, CostBreakdown, RawPost, Scan, ScanInput, ScanProgress, Signal, SourceId,
 } from "./types";
+
+function emptyCosts(): CostBreakdown {
+  return { expansion: 0, scoring: 0, drafting: 0, authorSummary: 0, apify: 0, total: 0 };
+}
+function sumCosts(c: CostBreakdown): number {
+  return c.expansion + c.scoring + c.drafting + c.authorSummary + c.apify;
+}
 
 export function createScan(input: ScanInput): Scan {
   const now = new Date().toISOString();
@@ -50,11 +47,9 @@ export async function runScan(scanId: string): Promise<void> {
   if (!scan) throw new Error("Scan not found");
   if (!scan.warnings) scan.warnings = [];
 
-  // Defensive: failures inside this fn must not leak past `runScan`. We catch,
-  // mark failed, and try to persist — but if the persist itself fails, swallow
-  // that secondary error so the primary cause is visible in logs.
+  const costs: CostBreakdown = emptyCosts();
+
   try {
-    let totalCost = 0;
     const includeComments = scan.input.includeComments ?? true;
     const enrichAuthors = scan.input.enrichAuthors ?? true;
     const draftReplies = scan.input.draftReplies ?? true;
@@ -71,7 +66,7 @@ export async function runScan(scanId: string): Promise<void> {
       subreddits: expansion.subreddits,
       rationale: expansion.rationale,
     };
-    totalCost += expansion.costUsd;
+    costs.expansion += expansion.costUsd;
     await safePut(scan);
 
     // ── 2. FETCH POSTS ──────────────────────────────────────────────────────
@@ -88,20 +83,20 @@ export async function runScan(scanId: string): Promise<void> {
       availableSourceCount++;
       sourceMap.set(id as SourceId, src);
       try {
-        const posts = await src.fetch({
+        const { items, costUsd } = await src.fetch({
           keywords: expansion.keywords,
           subreddits: id === "reddit" ? expansion.subreddits : undefined,
           timeWindow: scan.input.timeWindow,
           limit: scan.input.maxResults,
         });
-        allPosts.push(...posts);
+        allPosts.push(...items);
+        costs.apify += costUsd; // 0 for free providers
         await update(scan, {
           status: "fetching",
           message: `Pulled ${allPosts.length} from ${src.name}`,
           fetched: allPosts.length,
         });
       } catch (e: any) {
-        // One source failing shouldn't kill a multi-source scan
         const msg = `${src.name} fetch failed: ${e?.message ?? e}`;
         scan.warnings.push(msg);
         console.warn(msg);
@@ -133,8 +128,9 @@ export async function runScan(scanId: string): Promise<void> {
       for (const [srcId, src] of sourceMap.entries()) {
         if (!src.fetchComments) continue;
         try {
-          const cmnts = await src.fetchComments(posts, 3);
-          comments.push(...cmnts);
+          const { items, costUsd } = await src.fetchComments(posts, 3);
+          comments.push(...items);
+          costs.apify += costUsd;
         } catch (e: any) {
           const msg = `Comment fetch failed (${srcId}): ${e?.message ?? e}`;
           scan.warnings.push(msg);
@@ -159,7 +155,6 @@ export async function runScan(scanId: string): Promise<void> {
         deduped = allItems.filter((p) => !seen.has(p.externalId));
         duplicateCount = allItems.length - deduped.length;
       } catch (e: any) {
-        // Non-fatal — proceed with no dedup
         const msg = `Dedup lookup failed (continuing without dedup): ${e?.message ?? e}`;
         scan.warnings.push(msg);
         console.warn(msg);
@@ -167,11 +162,13 @@ export async function runScan(scanId: string): Promise<void> {
     }
 
     if (deduped.length === 0) {
+      costs.total = sumCosts(costs);
       scan.signals = [];
       scan.stats = {
         rawCount: allItems.length, postCount: posts.length, commentCount: comments.length,
         dedupedCount: 0, scoredCount: 0, duplicateCount,
-        durationMs: Date.now() - start, costUsd: totalCost, hubspotTasksCreated: 0,
+        durationMs: Date.now() - start, costUsd: costs.total, costs,
+        hubspotTasksCreated: 0,
       };
       scan.progress = {
         status: "complete",
@@ -196,10 +193,11 @@ export async function runScan(scanId: string): Promise<void> {
         if (!src.fetchAuthorContext) continue;
         try {
           const usernames = deduped.map((p) => p.author).filter(Boolean);
-          const ctxRaw = await src.fetchAuthorContext(usernames);
-          const { contexts, costUsd } = await summarizeAuthors(ctxRaw, scan.input);
+          const { contexts: ctxRaw, costUsd: fetchCost } = await src.fetchAuthorContext(usernames);
+          costs.apify += fetchCost;
+          const { contexts, costUsd: aiCost } = await summarizeAuthors(ctxRaw, scan.input);
           authors = { ...authors, ...contexts };
-          totalCost += costUsd;
+          costs.authorSummary += aiCost;
         } catch (e: any) {
           const msg = `Author enrichment failed (${srcId}, continuing without): ${e?.message ?? e}`;
           scan.warnings.push(msg);
@@ -224,7 +222,7 @@ export async function runScan(scanId: string): Promise<void> {
         });
       },
     );
-    totalCost += scoreCost;
+    costs.scoring += scoreCost;
     for (const w of scoreWarnings) scan.warnings.push(w);
 
     let finalSignals: Signal[] = scored.slice(0, scan.input.maxResults);
@@ -251,7 +249,7 @@ export async function runScan(scanId: string): Promise<void> {
             },
           );
           finalSignals = withDrafts;
-          totalCost += draftCost;
+          costs.drafting += draftCost;
         } catch (e: any) {
           const msg = `Reply drafting failed (continuing without drafts): ${e?.message ?? e}`;
           scan.warnings.push(msg);
@@ -287,7 +285,6 @@ export async function runScan(scanId: string): Promise<void> {
       }
     }
 
-    // Record seen for future dedup — best effort, don't fail scan if it fails
     if (scan.input.campaignKey) {
       try {
         await storage.addSeen(scan.input.campaignKey, deduped.map((p) => p.externalId));
@@ -298,6 +295,7 @@ export async function runScan(scanId: string): Promise<void> {
       }
     }
 
+    costs.total = sumCosts(costs);
     scan.signals = finalSignals;
     scan.stats = {
       rawCount: allItems.length,
@@ -307,7 +305,8 @@ export async function runScan(scanId: string): Promise<void> {
       scoredCount: scored.length,
       duplicateCount,
       durationMs: Date.now() - start,
-      costUsd: totalCost,
+      costUsd: costs.total,
+      costs,
       hubspotTasksCreated,
     };
     const warningSuffix = scan.warnings.length > 0 ? ` · ${scan.warnings.length} warning${scan.warnings.length === 1 ? "" : "s"}` : "";
@@ -329,18 +328,25 @@ export async function runScan(scanId: string): Promise<void> {
       total: scan.progress.total,
     };
     scan.updatedAt = new Date().toISOString();
-    // Persist the failure marker. If THIS fails, swallow so the original
-    // error remains visible in server logs (don't shadow with storage error).
+    // Even on failure, capture whatever cost we incurred up to the failure point
+    costs.total = sumCosts(costs);
+    if (costs.total > 0) {
+      scan.stats = scan.stats ?? {
+        rawCount: 0, postCount: 0, commentCount: 0,
+        dedupedCount: 0, scoredCount: 0, duplicateCount: 0,
+        durationMs: Date.now() - start, costUsd: 0, hubspotTasksCreated: 0,
+      };
+      scan.stats.costUsd = costs.total;
+      scan.stats.costs = costs;
+    }
     try { await storage.put(scan); } catch (persistErr) {
       console.error(`Failed to persist failed scan ${scan.id}:`, persistErr);
     }
-    // Don't rethrow — runScan is fire-and-forget. Caller already returned 201.
   }
 }
 
 function sanitizeError(err: any): string {
   const msg = err?.message ?? String(err);
-  // Strip any API keys, tokens, or PII that might have leaked into the message.
   return msg
     .replace(/sk-ant-[A-Za-z0-9_-]+/g, "sk-ant-***")
     .replace(/pat[A-Za-z0-9_-]{14,}/g, "pat***")
@@ -360,8 +366,6 @@ async function safePut(scan: Scan): Promise<void> {
   try {
     await storage.put(scan);
   } catch (e: any) {
-    // A mid-scan storage hiccup shouldn't kill the in-flight work. The next
-    // update will retry. Surface as a warning so the user sees it on completion.
     const msg = `Storage write failed (will retry next phase): ${e?.message ?? e}`;
     if (!scan.warnings) scan.warnings = [];
     if (!scan.warnings.includes(msg)) scan.warnings.push(msg);

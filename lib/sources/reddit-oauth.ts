@@ -47,6 +47,14 @@ async function getToken(): Promise<string> {
 
 function ua() { return process.env.REDDIT_USER_AGENT ?? "Pulse/1.0"; }
 
+/**
+ * Same hard cap as Apify — keeps Reddit OAuth from making hundreds of
+ * sub-queries when keywords × subreddits combinatorially explodes. Reddit
+ * OAuth is free per request but rate-limited (100/min), and we still pay
+ * for downstream scoring on whatever we fetch.
+ */
+const HARD_FETCH_CAP = 200;
+
 // ─── SEARCH ────────────────────────────────────────────────────────────────
 
 async function searchOne(opts: {
@@ -173,10 +181,17 @@ export const redditOauthSource: Source = {
   available: Boolean(process.env.REDDIT_CLIENT_ID && process.env.REDDIT_CLIENT_SECRET),
 
   async fetch({ keywords, subreddits, timeWindow, limit }) {
-    if (keywords.length === 0) return [];
+    if (keywords.length === 0) return { items: [], costUsd: 0 };
     const token = await getToken();
     const subList = subreddits && subreddits.length > 0 ? subreddits : [undefined];
-    const perQuery = Math.min(100, Math.ceil((limit * 2) / Math.max(1, subList.length)));
+
+    // How many results to ask Reddit for per query. We have keywords × subs
+    // queries running in parallel — scale perQuery down so total stays
+    // bounded even when the combinatorial space is huge.
+    const totalQueries = Math.max(1, keywords.length * subList.length);
+    const targetTotal = Math.min(Math.max(limit * 3, 30), HARD_FETCH_CAP);
+    const perQuery = Math.max(5, Math.min(100, Math.ceil(targetTotal / totalQueries) * 2));
+
     const tasks: Array<() => Promise<RawPost[]>> = [];
     for (const q of keywords) for (const sub of subList) {
       tasks.push(() => searchOne({ token, q, subreddit: sub, time: timeWindow, limit: perQuery }));
@@ -185,6 +200,8 @@ export const redditOauthSource: Source = {
     for (const batch of chunk(tasks, 6)) {
       const res = await Promise.all(batch.map((t) => t().catch(() => [])));
       for (const r of res) results.push(...r);
+      // Short-circuit if we already have plenty — saves Reddit quota
+      if (results.length >= HARD_FETCH_CAP * 2) break;
     }
     const seen = new Set<string>();
     const deduped: RawPost[] = [];
@@ -198,11 +215,11 @@ export const redditOauthSource: Source = {
       if (t !== 0) return t;
       return (b.metadata.upvotes ?? 0) - (a.metadata.upvotes ?? 0);
     });
-    return deduped.slice(0, Math.max(limit * 3, 30));
+    return { items: deduped.slice(0, HARD_FETCH_CAP), costUsd: 0 };
   },
 
   async fetchComments(posts, maxPerPost) {
-    if (posts.length === 0) return [];
+    if (posts.length === 0) return { items: [], costUsd: 0 };
     const token = await getToken();
     // Only pull comments for posts likely to have signal — high comment count or upvotes
     const candidates = posts
@@ -214,12 +231,12 @@ export const redditOauthSource: Source = {
       const res = await Promise.all(batch.map((p) => fetchTopComments(token, p, maxPerPost).catch(() => [])));
       for (const r of res) all.push(...r);
     }
-    return all;
+    return { items: all, costUsd: 0 };
   },
 
   async fetchAuthorContext(usernames) {
     const unique = Array.from(new Set(usernames.filter((u) => u && u !== "[deleted]")));
-    if (unique.length === 0) return {};
+    if (unique.length === 0) return { contexts: {}, costUsd: 0 };
     const token = await getToken();
     const out: Record<string, AuthorContext> = {};
     // Cap to 30 unique authors per scan to control rate
@@ -230,6 +247,6 @@ export const redditOauthSource: Source = {
         if (r) out[batch[i]] = r;
       }
     }
-    return out;
+    return { contexts: out, costUsd: 0 };
   },
 };

@@ -44,6 +44,9 @@ function Header() {
           <Link href="/history" className="btn btn-ghost">
             History
           </Link>
+          <Link href="/costs" className="btn btn-ghost">
+            Costs
+          </Link>
         </nav>
       </div>
     </header>

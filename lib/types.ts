@@ -117,6 +117,19 @@ export interface ScanProgress {
   total: number;
 }
 
+/** Per-phase cost breakdown in USD. Sum equals stats.costUsd. */
+export interface CostBreakdown {
+  // Anthropic — by phase
+  expansion: number;
+  scoring: number;
+  drafting: number;
+  authorSummary: number;
+  // Data providers
+  apify: number;
+  // Future: twitterApi, newsApi, etc.
+  total: number;
+}
+
 export interface Scan {
   id: string;
   createdAt: string;
@@ -144,9 +157,24 @@ export interface Scan {
     scoredCount: number;
     duplicateCount: number;
     durationMs: number;
+    /** Sum of all phase costs. Equals stats.costs.total when present. */
     costUsd: number;
+    /** Detailed per-phase breakdown. Optional for backward-compat with old scans. */
+    costs?: CostBreakdown;
     hubspotTasksCreated: number;
   };
+}
+
+export interface SourceFetchResult {
+  items: RawPost[];
+  /** USD spent on this fetch call (data provider only — Anthropic costs are
+   *  tracked separately in the scoring layer). Free providers return 0. */
+  costUsd: number;
+}
+
+export interface SourceAuthorContextResult {
+  contexts: Record<string, AuthorContext>;
+  costUsd: number;
 }
 
 export interface Source {
@@ -158,7 +186,10 @@ export interface Source {
     subreddits?: string[];
     timeWindow: TimeWindow;
     limit: number;
-  }): Promise<RawPost[]>;
-  fetchComments?(posts: RawPost[], maxPerPost: number): Promise<RawPost[]>;
-  fetchAuthorContext?(usernames: string[]): Promise<Record<string, AuthorContext>>;
+  }): Promise<SourceFetchResult>;
+  /** Optional — pull top comments for given posts. Sources that don't support
+   *  this can omit; orchestrator handles `undefined` gracefully. */
+  fetchComments?(posts: RawPost[], maxPerPost: number): Promise<SourceFetchResult>;
+  /** Optional — fetch a quick author profile. */
+  fetchAuthorContext?(usernames: string[]): Promise<SourceAuthorContextResult>;
 }
