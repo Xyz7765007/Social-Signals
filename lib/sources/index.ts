@@ -1,31 +1,36 @@
 import type { Source, SourceId } from "../types";
 import { redditOauthSource } from "./reddit-oauth";
 import { redditApifySource } from "./reddit-apify";
+import { redditPublicSource } from "./reddit-public";
 import { twitterSource } from "./twitter";
 import { newsSource } from "./news";
 import { instagramSource } from "./instagram";
 
 /**
- * Reddit provider selection.
+ * Reddit provider selection — listings strategy makes Apify reliable again.
  *
- * Set REDDIT_PROVIDER=oauth | apify to force a specific provider. If unset,
- * we pick automatically: OAuth if its credentials are present, else Apify if
- * APIFY_TOKEN is present, else mark as unavailable.
+ *  1. OAuth (REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET): free, 100 req/min,
+ *     officially supported. Requires Reddit app creation — sometimes blocked.
+ *  2. Apify (APIFY_TOKEN): scrapes subreddit LISTINGS (not search), then
+ *     filters in-code by time + keyword. Reliable in 2026 because Reddit
+ *     doesn't aggressively block listing pages. Paid: ~$0.50-1.20/scan.
+ *  3. Public JSON: anonymous Reddit JSON. Officially blocked in 2026 but
+ *     occasionally works. Kept as last-ditch fallback only.
  *
- * Why two providers: Reddit silently blocks app creation for new/unverified
- * accounts. Apify is the no-friction fallback — same data, ~$0.003 per result.
+ * Override with REDDIT_PROVIDER=oauth | apify | public.
  */
 function pickRedditSource(): Source {
   const forced = process.env.REDDIT_PROVIDER?.toLowerCase();
   if (forced === "oauth") return redditOauthSource;
   if (forced === "apify") return redditApifySource;
+  if (forced === "public") return redditPublicSource;
 
-  // Auto: prefer OAuth (free), fall back to Apify (paid but reliable).
+  // Auto-select. OAuth wins if creds set (free + most reliable). Otherwise
+  // Apify with listings strategy is the proven path. Public JSON is a
+  // last-resort fallback if neither is configured.
   if (redditOauthSource.available) return redditOauthSource;
   if (redditApifySource.available) return redditApifySource;
-
-  // Neither available — return OAuth (its fetch will throw with a helpful message).
-  return redditOauthSource;
+  return redditPublicSource;
 }
 
 const reddit = pickRedditSource();

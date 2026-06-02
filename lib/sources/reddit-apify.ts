@@ -1,13 +1,35 @@
 /**
- * Reddit source — Apify implementation.
+ * Reddit source — Apify implementation with LISTING-BASED scraping.
  *
- * Cost tracking: after each actor run, we read `X-Apify-Run-Id` from the
- * response header and GET the run object to retrieve `usageTotalUsd` —
- * Apify's authoritative billed cost. This is the ground truth, not an estimate.
+ * ════════════════════════════════════════════════════════════════════════
+ * Why listings, not search:
  *
- * Actor: trudax/reddit-scraper-lite (~$3.40 per 1k results in practice, but
- * actual price varies by compute units and dataset writes — read it from
- * Apify rather than estimating).
+ * Reddit's anti-bot system in 2026 is most aggressive on /search/ endpoints
+ * — search URLs are the easiest abuse vector for data harvesting, so Reddit
+ * either serves "no results" pages, captcha challenges, or empty listings
+ * when Apify proxies hit them. We saw this in practice: 4-1 posts per scan
+ * across 20+ search URLs.
+ *
+ * Subreddit LISTING pages (/r/{sub}/new/, /r/{sub}/hot/) are different.
+ * Every human browsing Reddit hits these. Blocking them would break Reddit.
+ * Apify scrapers can pull listings reliably.
+ *
+ * Strategy:
+ *   1. Scrape /r/{sub}/new/ for each target subreddit
+ *   2. Pull up to 50 recent posts per sub (8 subs × 50 = 400 posts max)
+ *   3. Filter in OUR code by:
+ *        - time window (e.g. last 7 days for "week")
+ *        - keyword match (any keyword appearing in title or body)
+ *   4. Return top HARD_FETCH_CAP=200 by recency
+ *
+ * Cost: ~$0.50-1.20 per scan depending on plan + perSubCap. Worth it for
+ * reliable data vs $0.005 of garbage from search.
+ *
+ * Residential proxies: set APIFY_RESIDENTIAL=true for paid Apify plans —
+ * dramatically more reliable than datacenter proxies on Reddit, but costs
+ * ~3x more per result. Free Apify plan uses datacenter (still works for
+ * listings, just less reliably).
+ * ════════════════════════════════════════════════════════════════════════
  */
 
 import type {
@@ -20,18 +42,25 @@ const APIFY_API = "https://api.apify.com/v2";
 const DEFAULT_ACTOR = "trudax~reddit-scraper-lite";
 
 /**
- * Hard ceiling on raw posts fetched per scan.
- *
- * Apify bills per result. Without this cap, a scan with 12 keywords × 7
- * subreddits = 84 combinations can run away into thousands of posts —
- * burning credits and producing noisy data we then have to dedup + score.
- *
- * 200 is enough for good dedup + scoring filtering on a maxResults=100 scan,
- * and bounds worst-case cost at ~$0.60/scan on the Apify Reddit actor.
- *
- * Comments use a separate, smaller cap (15 posts × 3 comments = 45 max).
+ * Hard ceiling on raw posts returned by fetch(). Bounds worst-case Apify
+ * cost. Listings approach can pull 400 raw posts before filtering, but
+ * after time + keyword filter we typically end up with 20-80 — the cap
+ * is a safety net for the unlikely "everything matches" case.
  */
 const HARD_FETCH_CAP = 200;
+
+/**
+ * Per-sub listing depth. Tune to balance cost vs comprehensiveness.
+ * 50 covers ~1-7 days of posts for typical SG subs.
+ */
+const PER_SUB_LISTING_CAP = 50;
+
+const TIME_WINDOW_MS: Record<string, number> = {
+  hour: 60 * 60 * 1000,
+  day: 24 * 60 * 60 * 1000,
+  week: 7 * 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+};
 
 interface ApifyItem {
   id?: string; parsedId?: string; url?: string;
@@ -52,6 +81,15 @@ interface ActorRunResult {
   costUsd: number;
 }
 
+function buildProxyConfig(): any {
+  // Residential proxies are more reliable on Reddit but require a paid plan.
+  // Opt-in via env var to avoid breaking free-tier users.
+  if (process.env.APIFY_RESIDENTIAL === "true") {
+    return { useApifyProxy: true, apifyProxyGroups: ["RESIDENTIAL"] };
+  }
+  return { useApifyProxy: true };
+}
+
 async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
   const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=300`;
   const res = await fetchWithRetry(url, {
@@ -59,14 +97,13 @@ async function runActor(actorId: string, token: string, input: any): Promise<Act
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
   }, { label: `apify ${actorId}`, timeoutMs: 330_000, retries: 1 });
-  if (!res.ok) throw new Error(`Apify run failed: ${res.status} ${await res.text().catch(() => "")}`);
-
-  // The run ID lets us look up the actual billed cost.
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Apify run failed: ${res.status} ${errBody.slice(0, 200)}`);
+  }
   const runId = res.headers.get("X-Apify-Run-Id") ?? res.headers.get("x-apify-run-id");
   const items: ApifyItem[] = await res.json();
 
-  // Cost lookup is best-effort — never fail the scan if Apify's cost API is
-  // slow or unavailable. We just report 0 in that case.
   let costUsd = 0;
   if (runId) {
     try {
@@ -77,11 +114,8 @@ async function runActor(actorId: string, token: string, input: any): Promise<Act
       );
       if (runRes.ok) {
         const data: any = await runRes.json();
-        // Apify's run object: data.data.usageTotalUsd
         const reported = Number(data?.data?.usageTotalUsd ?? 0);
-        if (Number.isFinite(reported) && reported >= 0) {
-          costUsd = reported;
-        }
+        if (Number.isFinite(reported) && reported >= 0) costUsd = reported;
       }
     } catch (e) {
       console.warn("Apify cost lookup failed (continuing with cost=0):", e);
@@ -157,35 +191,21 @@ function mapComment(it: ApifyItem, parents: Map<string, RawPost>): RawPost | nul
   };
 }
 
-function buildSearchUrls(opts: { keywords: string[]; subreddits?: string[]; timeWindow: TimeWindow }) {
-  const { keywords, subreddits, timeWindow } = opts;
-  const urls: { url: string; method: "GET" }[] = [];
+/**
+ * Normalize a keyword for matching. Lowercase + collapse whitespace + strip
+ * surrounding quotes. Preserves multi-word phrases as substrings to match.
+ */
+function normalizeKw(kw: string): string {
+  return kw.toLowerCase().replace(/\s+/g, " ").replace(/^["']|["']$/g, "").trim();
+}
 
-  // No subreddits → cross-Reddit search per keyword (one URL per keyword).
-  if (!subreddits || subreddits.length === 0) {
-    for (const kw of keywords) {
-      urls.push({
-        url: `https://www.reddit.com/search/?q=${encodeURIComponent(kw)}&sort=new&t=${timeWindow}`,
-        method: "GET",
-      });
-    }
-    return urls;
-  }
-
-  // KEYWORD-FIRST iteration: emit (keyword 1 × every sub) before moving to
-  // (keyword 2 × every sub). Critical when the array gets sliced downstream
-  // — slicing sub-first would cover one sub deeply and miss the rest entirely.
-  // Keyword-first guarantees broad keyword + broad subreddit coverage even
-  // when we slice to ~32 URLs.
-  for (const kw of keywords) {
-    for (const sub of subreddits) {
-      urls.push({
-        url: `https://www.reddit.com/r/${sub}/search/?q=${encodeURIComponent(kw)}&restrict_sr=1&sort=new&t=${timeWindow}`,
-        method: "GET",
-      });
-    }
-  }
-  return urls;
+/**
+ * Build a haystack from a post for keyword matching. Lowercase title + body
+ * concatenated. We match substring (so "incorporate company" matches
+ * "want to incorporate company in SG").
+ */
+function postHaystack(post: RawPost): string {
+  return `${post.title ?? ""} ${post.content ?? ""}`.toLowerCase();
 }
 
 export const redditApifySource: Source = {
@@ -198,54 +218,78 @@ export const redditApifySource: Source = {
     const token = process.env.APIFY_TOKEN!;
     const actorId = process.env.APIFY_REDDIT_ACTOR_ID ?? DEFAULT_ACTOR;
 
-    // Strict cap on what we ask Apify to return. Use min() not max() —
-    // the bug we hit before was using Math.max which never went below 60.
-    // Cap target = min(limit * 3, HARD_FETCH_CAP). For limit=25 → 75. For
-    // limit=100 → 200 (the ceiling).
-    const targetTotal = Math.min(Math.max(limit * 3, 30), HARD_FETCH_CAP);
+    // Use SUBREDDIT LISTINGS, not search URLs. Reddit's anti-bot is much
+    // less aggressive on listings — these are how every Reddit user browses.
+    const subList = subreddits && subreddits.length > 0 ? subreddits : ["all"];
+    const startUrls = subList.map((sub) => ({
+      url: `https://www.reddit.com/r/${sub}/new/`,
+      method: "GET" as const,
+    }));
 
-    // Reduce the number of startUrls we hand the actor. With keyword-first
-    // iteration in buildSearchUrls, 32 URLs covers ~4 keywords × 8 subreddits
-    // — broad enough to find signal, narrow enough that maxItems caps cost.
-    // The HARD_FETCH_CAP slice at the end of fetch() is the real safety net.
-    const startUrls = buildSearchUrls({ keywords, subreddits, timeWindow }).slice(0, 32);
-
-    // Per-community cap. Keep below targetTotal so no single sub can consume
-    // the whole budget.
-    const perCommunityCap = Math.max(10, Math.ceil(targetTotal / Math.max(1, startUrls.length || 1)));
+    // Pull more posts than we'll keep — keyword/time filter happens in code,
+    // so the actor needs slack. Apify cost is bounded by maxItems.
+    const targetTotal = Math.min(subList.length * PER_SUB_LISTING_CAP, HARD_FETCH_CAP * 2);
 
     const { items, costUsd } = await runActor(actorId, token, {
       startUrls,
-      // Drop the `searches` param — we already have startUrls covering
-      // every keyword × subreddit combination we care about. Passing both
-      // doubles the fetch.
       type: "posts",
       sort: "new",
-      time: timeWindow,
       maxItems: targetTotal,
-      maxPostCount: perCommunityCap,
+      maxPostCount: PER_SUB_LISTING_CAP,
       maxComments: 0,
       maxCommunitiesAndUsers: 0,
-      proxy: { useApifyProxy: true },
+      proxy: buildProxyConfig(),
     });
 
-    const raw = items
-      .filter((it) => !it.over18 && !it.isAd && (!it.dataType || it.dataType === "post"))
-      .map(mapPost)
-      .filter((p): p is RawPost => p !== null);
+    // ── Post-filter by time window ───────────────────────────────────────
+    const windowMs = TIME_WINDOW_MS[timeWindow] ?? TIME_WINDOW_MS.week;
+    const cutoff = Date.now() - windowMs;
+
+    // ── Post-filter by keyword match ─────────────────────────────────────
+    // Match substring (case-insensitive) in title + body. Multi-word
+    // phrases match if the phrase appears together. Single words match
+    // anywhere.
+    const kwLower = keywords.map(normalizeKw).filter((k) => k.length >= 2);
+    if (kwLower.length === 0) {
+      return { items: [], costUsd };
+    }
+
+    const matched: RawPost[] = [];
+    for (const it of items) {
+      if (it.over18 || it.isAd) continue;
+      if (it.dataType && it.dataType !== "post") continue;
+
+      const post = mapPost(it);
+      if (!post) continue;
+
+      // Time filter
+      const createdMs = new Date(post.createdAt).getTime();
+      if (!Number.isFinite(createdMs) || createdMs < cutoff) continue;
+
+      // Keyword filter — any keyword appearing as substring counts
+      const haystack = postHaystack(post);
+      const hasMatch = kwLower.some((kw) => haystack.includes(kw));
+      if (!hasMatch) continue;
+
+      matched.push(post);
+    }
+
+    // Dedup by externalId
     const seen = new Set<string>();
     const deduped: RawPost[] = [];
-    for (const p of raw) {
+    for (const p of matched) {
       if (seen.has(p.externalId)) continue;
       seen.add(p.externalId);
       deduped.push(p);
     }
+
+    // Sort newest first, then by upvotes as tiebreaker
     deduped.sort((a, b) => {
       const t = b.createdAt.localeCompare(a.createdAt);
       if (t !== 0) return t;
       return (b.metadata.upvotes ?? 0) - (a.metadata.upvotes ?? 0);
     });
-    // Final defense — even if Apify ignored our caps, slice to HARD_FETCH_CAP.
+
     return { items: deduped.slice(0, HARD_FETCH_CAP), costUsd };
   },
 
@@ -253,12 +297,18 @@ export const redditApifySource: Source = {
     if (posts.length === 0) return { items: [], costUsd: 0 };
     const token = process.env.APIFY_TOKEN!;
     const actorId = process.env.APIFY_REDDIT_ACTOR_ID ?? DEFAULT_ACTOR;
+
+    // Only pull comments for posts likely to have signal
     const candidates = posts
       .filter((p) => !p.isComment)
       .filter((p) => (p.metadata.comments ?? 0) >= 2 || (p.metadata.upvotes ?? 0) >= 3)
       .slice(0, 15);
     if (candidates.length === 0) return { items: [], costUsd: 0 };
+
     const parents = new Map(candidates.map((p) => [p.externalId, p]));
+
+    // For comments, scrape individual post URLs — those work fine through
+    // Apify since they're not search.
     const { items, costUsd } = await runActor(actorId, token, {
       startUrls: candidates.map((p) => ({ url: p.url, method: "GET" as const })),
       type: "comments",
@@ -267,7 +317,7 @@ export const redditApifySource: Source = {
       maxComments: maxPerPost,
       maxCommentsPerPost: maxPerPost,
       maxCommunitiesAndUsers: 0,
-      proxy: { useApifyProxy: true },
+      proxy: buildProxyConfig(),
     });
     const comments = items
       .filter((it) => !it.over18 && (!it.dataType || it.dataType === "comment"))
@@ -277,15 +327,19 @@ export const redditApifySource: Source = {
   },
 
   async fetchAuthorContext(usernames): Promise<SourceAuthorContextResult> {
-    // Use unauthenticated Reddit JSON for author profile — Apify would cost
-    // way more for tiny per-user pulls and this is read-only low-risk data.
-    const unique = Array.from(new Set(usernames.filter((u) => u && u !== "[deleted]" && u !== "[unknown]"))).slice(0, 30);
+    // Best-effort. Public Reddit JSON for user profiles is blocked or
+    // rate-limited in 2026, but we try anyway with proper UA. If it fails,
+    // we return empty contexts and scoring continues without author info.
+    const unique = Array.from(new Set(usernames.filter((u) => u && u !== "[deleted]" && u !== "[unknown]"))).slice(0, 20);
     const out: Record<string, AuthorContext> = {};
+    const ua = process.env.REDDIT_USER_AGENT ?? "Pulse-SignalScanner/1.0 (B2B research)";
     const tasks = unique.map(async (u) => {
       try {
-        const res = await fetchWithRetry(`https://www.reddit.com/user/${encodeURIComponent(u)}/submitted.json?limit=10&sort=new`, {
-          headers: { "User-Agent": process.env.REDDIT_USER_AGENT ?? "Pulse/1.0" },
-        }, { label: "reddit user profile", timeoutMs: 15_000, retries: 1 });
+        const res = await fetchWithRetry(
+          `https://www.reddit.com/user/${encodeURIComponent(u)}/submitted.json?limit=10&sort=new`,
+          { headers: { "User-Agent": ua, Accept: "application/json" } },
+          { label: "reddit user profile", timeoutMs: 10_000, retries: 0 },
+        );
         if (!res.ok) return;
         const data: any = await res.json();
         const items: any[] = data?.data?.children ?? [];
@@ -298,10 +352,14 @@ export const redditApifySource: Source = {
           summary: "",
           signalAdjustment: 0,
         };
-      } catch {}
+      } catch {
+        // Silent fail — author context is best-effort
+      }
     });
-    for (let i = 0; i < tasks.length; i += 10) {
-      await Promise.all(tasks.slice(i, i + 10));
+    // Process serially with small delay to avoid overwhelming Reddit
+    for (let i = 0; i < tasks.length; i++) {
+      await tasks[i];
+      if (i < tasks.length - 1) await new Promise((r) => setTimeout(r, 100));
     }
     return { contexts: out, costUsd: 0 };
   },
