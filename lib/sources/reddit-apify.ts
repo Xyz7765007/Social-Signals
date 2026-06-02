@@ -50,10 +50,15 @@ const DEFAULT_ACTOR = "trudax~reddit-scraper-lite";
 const HARD_FETCH_CAP = 200;
 
 /**
- * Per-sub listing depth. Tune to balance cost vs comprehensiveness.
- * 50 covers ~1-7 days of posts for typical SG subs.
+ * Per-sub listing depth. Tune to balance cost vs comprehensiveness vs
+ * Vercel's 300s function timeout.
+ *
+ * 25 = Reddit's default listing page size. Going higher (50, 100) requires
+ * the actor to paginate, which serializes requests and balloons runtime
+ * past Vercel's 300s limit. With 8 subs × 25 posts × ~3s per page = ~60s
+ * actor runtime, comfortably under timeout.
  */
-const PER_SUB_LISTING_CAP = 50;
+const PER_SUB_LISTING_CAP = 25;
 
 const TIME_WINDOW_MS: Record<string, number> = {
   hour: 60 * 60 * 1000,
@@ -91,12 +96,16 @@ function buildProxyConfig(): any {
 }
 
 async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
-  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=300`;
+  // memory=4096 + faster timeout = parallelism within the actor.
+  // Apify scales concurrency based on memory allocation, so bumping from
+  // 2048 to 4096 doubles parallel scraping threads. Critical for fetching
+  // 8 subreddit listings in <90s vs >300s.
+  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=4096&timeout=180`;
   const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-  }, { label: `apify ${actorId}`, timeoutMs: 330_000, retries: 1 });
+  }, { label: `apify ${actorId}`, timeoutMs: 200_000, retries: 0 });
   if (!res.ok) {
     const errBody = await res.text().catch(() => "");
     throw new Error(`Apify run failed: ${res.status} ${errBody.slice(0, 200)}`);
