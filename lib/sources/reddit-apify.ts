@@ -25,10 +25,9 @@
  * Cost: ~$0.50-1.20 per scan depending on plan + perSubCap. Worth it for
  * reliable data vs $0.005 of garbage from search.
  *
- * Residential proxies: set APIFY_RESIDENTIAL=true for paid Apify plans —
- * dramatically more reliable than datacenter proxies on Reddit, but costs
- * ~3x more per result. Free Apify plan uses datacenter (still works for
- * listings, just less reliably).
+ * Residential proxies are the actor's DEFAULT. We let it use them unless
+ * you explicitly opt-out with APIFY_DATACENTER_PROXY=true (cheaper but
+ * less reliable — Reddit blocks datacenter IPs more aggressively).
  * ════════════════════════════════════════════════════════════════════════
  */
 
@@ -86,26 +85,18 @@ interface ActorRunResult {
   costUsd: number;
 }
 
-function buildProxyConfig(): any {
-  // Residential proxies are more reliable on Reddit but require a paid plan.
-  // Opt-in via env var to avoid breaking free-tier users.
-  if (process.env.APIFY_RESIDENTIAL === "true") {
-    return { useApifyProxy: true, apifyProxyGroups: ["RESIDENTIAL"] };
-  }
-  return { useApifyProxy: true };
-}
-
 async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
-  // memory=4096 + faster timeout = parallelism within the actor.
-  // Apify scales concurrency based on memory allocation, so bumping from
-  // 2048 to 4096 doubles parallel scraping threads. Critical for fetching
-  // 8 subreddit listings in <90s vs >300s.
-  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=4096&timeout=180`;
+  // memory=8192 gives the actor ~8-way browser parallelism (Apify's
+  // Crawlee allocates ~512MB per concurrent browser). With 8 subreddit
+  // listings × 30s scrollTimeout, sequential = 240s (exceeds Vercel cap).
+  // 8-way parallel = ~30-50s. timeout=240s leaves room for orchestrator
+  // overhead within Vercel's 300s function limit.
+  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=8192&timeout=240`;
   const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-  }, { label: `apify ${actorId}`, timeoutMs: 200_000, retries: 0 });
+  }, { label: `apify ${actorId}`, timeoutMs: 260_000, retries: 0 });
   if (!res.ok) {
     const errBody = await res.text().catch(() => "");
     throw new Error(`Apify run failed: ${res.status} ${errBody.slice(0, 200)}`);
@@ -232,7 +223,6 @@ export const redditApifySource: Source = {
     const subList = subreddits && subreddits.length > 0 ? subreddits : ["all"];
     const startUrls = subList.map((sub) => ({
       url: `https://www.reddit.com/r/${sub}/new/`,
-      method: "GET" as const,
     }));
 
     // Pull more posts than we'll keep — keyword/time filter happens in code,
@@ -241,13 +231,34 @@ export const redditApifySource: Source = {
 
     const { items, costUsd } = await runActor(actorId, token, {
       startUrls,
-      type: "posts",
       sort: "new",
+      // Schema flags — drop the work we don't need so the actor finishes faster.
+      skipComments: true,   // listing scrape doesn't need per-post comments
+      skipCommunity: true,  // don't pull community metadata pages
+      skipUserPosts: true,  // don't follow into user profiles
+      includeNSFW: false,   // actor default is TRUE — explicitly off
       maxItems: targetTotal,
       maxPostCount: PER_SUB_LISTING_CAP,
-      maxComments: 0,
-      maxCommunitiesAndUsers: 0,
-      proxy: buildProxyConfig(),
+      // scrollTimeout (seconds): time the actor keeps scrolling the listing
+      // page to load more posts via infinite scroll. Actor's default is 40s.
+      // We set 30s — gives Reddit's JS-heavy page time to render the initial
+      // listing AND a few seconds to load any lazy-rendered posts, but
+      // shaves off enough to fit within Vercel's 300s function cap when
+      // running across 8 subs with memory=8192 parallelism.
+      // Going lower (e.g. 8s) caused pages to bail before fully rendering →
+      // 1-4 posts pulled instead of 25.
+      scrollTimeout: 30,
+      // Server-side time filter — let actor skip pages of old posts.
+      // Format is ISO date string; actor stops when it sees posts older
+      // than this. Backstopped by our in-code time filter below.
+      postDateLimit: new Date(Date.now() - (TIME_WINDOW_MS[timeWindow] ?? TIME_WINDOW_MS.week)).toISOString(),
+      // proxy: omitted — actor default is `{useApifyProxy: true,
+      // apifyProxyGroups: ["RESIDENTIAL"]}` which is what we want. Overriding
+      // to plain datacenter was making us look like a bot to Reddit. Opt-out
+      // to datacenter (cheaper but unreliable) via APIFY_DATACENTER_PROXY=true.
+      ...(process.env.APIFY_DATACENTER_PROXY === "true"
+        ? { proxy: { useApifyProxy: true, apifyProxyGroups: [] } }
+        : {}),
     });
 
     // ── Post-filter by time window ───────────────────────────────────────
@@ -319,14 +330,20 @@ export const redditApifySource: Source = {
     // For comments, scrape individual post URLs — those work fine through
     // Apify since they're not search.
     const { items, costUsd } = await runActor(actorId, token, {
-      startUrls: candidates.map((p) => ({ url: p.url, method: "GET" as const })),
-      type: "comments",
+      startUrls: candidates.map((p) => ({ url: p.url })),
       sort: "top",
+      skipUserPosts: true,
+      skipCommunity: true,
+      includeNSFW: false,
       maxItems: candidates.length * maxPerPost,
       maxComments: maxPerPost,
-      maxCommentsPerPost: maxPerPost,
-      maxCommunitiesAndUsers: 0,
-      proxy: buildProxyConfig(),
+      // 15s scroll budget for comment pages — top comments are at the top
+      // and load quickly, but Reddit's post page still needs ~5-10s to
+      // render before extraction. 15s is a safe floor.
+      scrollTimeout: 15,
+      ...(process.env.APIFY_DATACENTER_PROXY === "true"
+        ? { proxy: { useApifyProxy: true, apifyProxyGroups: [] } }
+        : {}),
     });
     const comments = items
       .filter((it) => !it.over18 && (!it.dataType || it.dataType === "comment"))
