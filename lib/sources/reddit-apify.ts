@@ -52,12 +52,11 @@ const HARD_FETCH_CAP = 200;
  * Per-sub listing depth. Tune to balance cost vs comprehensiveness vs
  * Vercel's 300s function timeout.
  *
- * 25 = Reddit's default listing page size. Going higher (50, 100) requires
- * the actor to paginate, which serializes requests and balloons runtime
- * past Vercel's 300s limit. With 8 subs × 25 posts × ~3s per page = ~60s
- * actor runtime, comfortably under timeout.
+ * 20 = slightly under Reddit's default page size of 25. Smaller cap means
+ * the actor needs less scroll time per sub. With 3 subs × ~30s + startup
+ * ≈ 100s per chunk, comfortable under Apify's 180s actor timeout.
  */
-const PER_SUB_LISTING_CAP = 25;
+const PER_SUB_LISTING_CAP = 20;
 
 const TIME_WINDOW_MS: Record<string, number> = {
   hour: 60 * 60 * 1000,
@@ -126,67 +125,100 @@ interface ActorRunResult {
   costUsd: number;
 }
 
+/**
+ * Estimated cost per scraped result for trudax/reddit-scraper-lite.
+ *
+ * Actor docs: "1,000 results for less than $4 in platform usage credits"
+ * → ~$0.004 per result.
+ *
+ * We use $0.005 to slightly over-estimate (preferable to under-reporting cost
+ * to the user). Real billing observed: $0.24 for ~50 items = $0.0048/item.
+ *
+ * This is a FALLBACK. If the response includes a runId we can look up the
+ * actual billed cost from /actor-runs/{id}. Estimate is used when the runId
+ * header is missing (which happens on this actor in current Apify API).
+ */
+const APIFY_COST_PER_RESULT = 0.005;
+
 async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
-  // Two-call pattern: POST /run-sync gives us the run object (with reliable
-  // `usageTotalUsd`), then GET /datasets/{id}/items pulls the data.
+  // /run-sync-get-dataset-items: proven endpoint that returns dataset items.
   //
-  // Why not /run-sync-get-dataset-items (one call): that endpoint returns
-  // raw items but we have to extract runId from response headers to fetch
-  // cost separately. Header names have changed across Apify API versions
-  // and we saw cost lookups silently returning 0 in production. The run
-  // object explicitly contains usageTotalUsd + defaultDatasetId — both
-  // structured fields we can rely on.
-  //
-  // Cost: 2 HTTP requests instead of 1, but second one is fast (<2s).
-  const runUrl = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync?token=${token}&memory=2048&timeout=180`;
-  const runRes = await fetchWithRetry(runUrl, {
+  // We previously tried /run-sync (no "-get-dataset-items") hoping it would
+  // return the run object with cost info — turns out that endpoint returns
+  // the actor's OUTPUT key-value store record, which is empty for this
+  // actor. Triggered "Unexpected end of JSON input" on every chunk.
+  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=180`;
+  const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-  }, { label: `apify ${actorId} run`, timeoutMs: 200_000, retries: 0 });
+  }, { label: `apify ${actorId}`, timeoutMs: 200_000, retries: 0 });
 
-  if (!runRes.ok) {
-    const errBody = await runRes.text().catch(() => "");
-    throw new Error(`Apify run failed: ${runRes.status} ${errBody.slice(0, 200)}`);
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Apify HTTP ${res.status}: ${errBody.slice(0, 200)}`);
   }
 
-  const runJson: any = await runRes.json();
-  // Apify wraps in { data: {...} }; some clients see it flat. Support both.
-  const run = runJson?.data ?? runJson;
-
-  // Cost — structured, reliable, billed amount
-  const reportedCost = Number(run?.usageTotalUsd ?? 0);
-  const costUsd = Number.isFinite(reportedCost) && reportedCost >= 0 ? reportedCost : 0;
-
-  // Dataset ID — where the actor pushed its scraped items
-  const datasetId = run?.defaultDatasetId ?? run?.datasetId;
-  if (!datasetId) {
-    console.warn(`Apify run ${run?.id ?? "?"} succeeded but has no defaultDatasetId. Status: ${run?.status}`);
-    return { items: [], costUsd };
+  // Defensive parsing — Apify sometimes returns empty body when the actor
+  // times out, and JSON.parse("") throws "Unexpected end of JSON input"
+  // which is hard to diagnose. Read as text first and handle each failure
+  // mode explicitly.
+  const text = await res.text();
+  if (text.trim().length === 0) {
+    console.warn(`Apify ${actorId}: empty response body (actor likely timed out before producing items)`);
+    return { items: [], costUsd: 0 };
   }
 
-  // Step 2: fetch dataset items. limit=500 covers HARD_FETCH_CAP * 2.
-  // clean=1 strips internal metadata (smaller response).
-  const itemsUrl = `${APIFY_API}/datasets/${encodeURIComponent(datasetId)}/items?token=${token}&format=json&clean=1&limit=500`;
-  const itemsRes = await fetchWithRetry(itemsUrl, {}, {
-    label: `apify dataset ${datasetId}`,
-    timeoutMs: 30_000,
-    retries: 1,
-  });
-
-  if (!itemsRes.ok) {
-    console.warn(`Apify dataset ${datasetId} fetch failed: ${itemsRes.status}`);
-    return { items: [], costUsd };
+  let items: ApifyItem[];
+  try {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) {
+      console.warn(`Apify ${actorId}: response not array (got ${typeof parsed}). Preview: ${text.slice(0, 150)}`);
+      return { items: [], costUsd: 0 };
+    }
+    items = parsed;
+  } catch (e: any) {
+    console.warn(`Apify ${actorId}: JSON parse failed (${e?.message}). Preview: ${text.slice(0, 150)}`);
+    return { items: [], costUsd: 0 };
   }
 
-  const items: any = await itemsRes.json();
-  if (!Array.isArray(items)) {
-    console.warn(`Apify dataset ${datasetId} returned non-array:`, typeof items);
-    return { items: [], costUsd };
+  // Try to get actual billed cost. Apify-Run-Id header may or may not be
+  // present depending on actor + API version. Fall back to per-result estimate.
+  const runId =
+    res.headers.get("Apify-Run-Id") ??
+    res.headers.get("X-Apify-Run-Id") ??
+    res.headers.get("apify-run-id");
+
+  let costUsd = 0;
+  let costSource = "estimated";
+
+  if (runId) {
+    try {
+      const runRes = await fetchWithRetry(
+        `${APIFY_API}/actor-runs/${runId}?token=${token}`,
+        {},
+        { label: "apify cost", timeoutMs: 15_000, retries: 1 },
+      );
+      if (runRes.ok) {
+        const data: any = await runRes.json();
+        const reported = Number(data?.data?.usageTotalUsd ?? 0);
+        if (Number.isFinite(reported) && reported > 0) {
+          costUsd = reported;
+          costSource = "billed";
+        }
+      }
+    } catch {
+      // Fall through to estimate
+    }
   }
 
-  console.log(`Apify run ${run?.id ?? "?"} → ${items.length} items, $${costUsd.toFixed(4)}`);
-  return { items: items as ApifyItem[], costUsd };
+  if (costUsd === 0) {
+    // Fallback: estimate from item count
+    costUsd = items.length * APIFY_COST_PER_RESULT;
+  }
+
+  console.log(`Apify ${actorId} → ${items.length} items, $${costUsd.toFixed(4)} (${costSource})`);
+  return { items, costUsd };
 }
 
 function mapPost(it: ApifyItem): RawPost | null {
@@ -372,7 +404,14 @@ export const redditApifySource: Source = {
           includeNSFW: false,
           maxItems: targetPerChunk,
           maxPostCount: PER_SUB_LISTING_CAP,
-          scrollTimeout: 25,
+          // scrollTimeout=20 (seconds). 25 was right at the timeout cliff —
+          // one chunk hit Apify's 180s actor timeout when it had 2 heavy
+          // subs (singapore + smallbusiness). 20s per sub × 3 subs +
+          // startup ≈ 95s, comfortable margin under 180s.
+          //
+          // Lower than 20 (we tried 8) caused pages to bail before fully
+          // rendering. 20 is the practical floor for Reddit's JS-heavy pages.
+          scrollTimeout: 20,
           postDateLimit,
           ...proxyOverride,
         });

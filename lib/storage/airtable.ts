@@ -24,7 +24,7 @@
  * and tries again without restarting).
  */
 
-import type { Scan } from "../types";
+import type { Scan, ScanPreset } from "../types";
 import type { Storage } from "./index";
 import { fetchWithRetry } from "../fetch-retry";
 
@@ -45,7 +45,7 @@ interface FieldSpec {
   options?: Record<string, any>;
 }
 
-type WhichTable = "scans" | "seen";
+type WhichTable = "scans" | "seen" | "presets";
 
 const SCHEMA: Record<WhichTable, { fields: FieldSpec[] }> = {
   scans: {
@@ -92,6 +92,31 @@ const SCHEMA: Record<WhichTable, { fields: FieldSpec[] }> = {
       },
     ],
   },
+  presets: {
+    fields: [
+      { name: "Preset ID", type: "singleLineText" },
+      { name: "Name", type: "singleLineText" },
+      {
+        name: "Created At",
+        type: "dateTime",
+        options: {
+          dateFormat: { name: "iso" },
+          timeFormat: { name: "24hour" },
+          timeZone: "utc",
+        },
+      },
+      {
+        name: "Updated At",
+        type: "dateTime",
+        options: {
+          dateFormat: { name: "iso" },
+          timeFormat: { name: "24hour" },
+          timeZone: "utc",
+        },
+      },
+      { name: "Input JSON", type: "multilineText" },
+    ],
+  },
 };
 
 // ─── Metadata API types ────────────────────────────────────────────────────
@@ -104,17 +129,20 @@ interface MetaTable { id: string; name: string; fields: MetaField[]; primaryFiel
 
 class AirtableStorage implements Storage {
   private schemaReady: Promise<void> | null = null;
-  private tableIds: Record<WhichTable, string | null> = { scans: null, seen: null };
+  private tableIds: Record<WhichTable, string | null> = { scans: null, seen: null, presets: null };
 
   constructor(
     private readonly apiKey: string,
     private readonly baseId: string,
     private readonly scansTable: string,
     private readonly seenTable: string,
+    private readonly presetsTable: string,
   ) {}
 
   private nameOf(which: WhichTable): string {
-    return which === "scans" ? this.scansTable : this.seenTable;
+    if (which === "scans") return this.scansTable;
+    if (which === "seen") return this.seenTable;
+    return this.presetsTable;
   }
 
   private url(table: string, suffix = ""): string {
@@ -161,7 +189,7 @@ class AirtableStorage implements Storage {
     const existingByName = new Map<string, MetaTable>();
     for (const t of (data.tables ?? []) as MetaTable[]) existingByName.set(t.name, t);
 
-    for (const which of ["scans", "seen"] as const) {
+    for (const which of ["scans", "seen", "presets"] as const) {
       const name = this.nameOf(which);
       const existing = existingByName.get(name);
       if (!existing) {
@@ -379,6 +407,73 @@ class AirtableStorage implements Storage {
       if (!res.ok) throw new Error(`Airtable seen create failed: ${res.status} ${await res.text()}`);
     }
   }
+
+  // ─── Presets ──────────────────────────────────────────────────────────────
+
+  private toPresetFields(p: ScanPreset) {
+    return {
+      "Preset ID": p.id,
+      Name: p.name,
+      "Created At": p.createdAt,
+      "Updated At": p.updatedAt,
+      "Input JSON": JSON.stringify(p.input),
+    };
+  }
+  private fromPresetRecord(r: ATRecord): ScanPreset | null {
+    try {
+      const input = JSON.parse(r.fields["Input JSON"] ?? "null");
+      if (!input) return null;
+      return {
+        id: String(r.fields["Preset ID"] ?? ""),
+        name: String(r.fields["Name"] ?? ""),
+        createdAt: String(r.fields["Created At"] ?? new Date().toISOString()),
+        updatedAt: String(r.fields["Updated At"] ?? new Date().toISOString()),
+        input,
+      };
+    } catch { return null; }
+  }
+
+  async listPresets() {
+    await this.ensureSchema();
+    const url = `${this.url(this.presetsTable)}?pageSize=100&sort%5B0%5D%5Bfield%5D=Updated+At&sort%5B0%5D%5Bdirection%5D=desc`;
+    const res = await fetchWithRetry(url, { headers: this.headers() });
+    if (!res.ok) throw new Error(`Airtable presets list failed: ${res.status} ${await res.text()}`);
+    const data: any = await res.json();
+    return (data.records ?? []).map((r: ATRecord) => this.fromPresetRecord(r)).filter((p: any): p is ScanPreset => p !== null);
+  }
+  async getPreset(id: string) {
+    await this.ensureSchema();
+    const r = await this.find(this.presetsTable, `{Preset ID}='${id.replace(/'/g, "\\'")}'`);
+    return r ? this.fromPresetRecord(r) : null;
+  }
+  async putPreset(preset: ScanPreset) {
+    await this.ensureSchema();
+    const fields = this.toPresetFields(preset);
+    if ((fields["Input JSON"] as string).length > 95_000) {
+      throw new Error(
+        `Preset Input JSON too large for Airtable cell (${(fields["Input JSON"] as string).length} chars).`,
+      );
+    }
+    const existing = await this.find(this.presetsTable, `{Preset ID}='${preset.id.replace(/'/g, "\\'")}'`);
+    if (existing) {
+      const res = await fetchWithRetry(this.url(this.presetsTable, `/${existing.id}`), {
+        method: "PATCH", headers: this.headers(), body: JSON.stringify({ fields }),
+      });
+      if (!res.ok) throw new Error(`Airtable preset update failed: ${res.status} ${await res.text()}`);
+    } else {
+      const res = await fetchWithRetry(this.url(this.presetsTable), {
+        method: "POST", headers: this.headers(), body: JSON.stringify({ records: [{ fields }] }),
+      });
+      if (!res.ok) throw new Error(`Airtable preset create failed: ${res.status} ${await res.text()}`);
+    }
+  }
+  async deletePreset(id: string) {
+    await this.ensureSchema();
+    const r = await this.find(this.presetsTable, `{Preset ID}='${id.replace(/'/g, "\\'")}'`);
+    if (!r) return;
+    const res = await fetchWithRetry(this.url(this.presetsTable, `/${r.id}`), { method: "DELETE", headers: this.headers() });
+    if (!res.ok) throw new Error(`Airtable preset delete failed: ${res.status} ${await res.text()}`);
+  }
 }
 
 function humanType(f: FieldSpec): string {
@@ -398,6 +493,7 @@ export function maybeAirtable(): Storage | null {
   const baseId = process.env.AIRTABLE_BASE_ID;
   const scansTable = process.env.AIRTABLE_TABLE_NAME ?? "Scans";
   const seenTable = process.env.AIRTABLE_SEEN_TABLE_NAME ?? "Seen Signals";
+  const presetsTable = process.env.AIRTABLE_PRESETS_TABLE_NAME ?? "Scan Presets";
   if (!apiKey || !baseId) return null;
-  return new AirtableStorage(apiKey, baseId, scansTable, seenTable);
+  return new AirtableStorage(apiKey, baseId, scansTable, seenTable, presetsTable);
 }

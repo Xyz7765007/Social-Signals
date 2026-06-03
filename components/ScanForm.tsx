@@ -1,9 +1,23 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
-import { ArrowRight, Plus, X, Loader2, Sparkles, ChevronDown } from "lucide-react";
-import type { SignalType, TimeWindow } from "@/lib/types";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowRight, Plus, X, Loader2, Sparkles, ChevronDown, Bookmark, Check, Trash2 } from "lucide-react";
+import type { ScanInput, ScanPreset, SignalType, TimeWindow } from "@/lib/types";
+
+interface PresetLite {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  preview: {
+    businessSnippet: string;
+    keywordCount: number;
+    subredditCount: number;
+    campaignKey: string | null;
+    timeWindow: string;
+  };
+}
 
 const SIGNAL_OPTIONS: { id: SignalType; label: string; hint: string }[] = [
   { id: "pain_point", label: "Pain points", hint: "complaints, frustrations" },
@@ -55,6 +69,133 @@ export default function ScanForm() {
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // ─── Saved setups (presets) ──────────────────────────────────────────────
+  const [presets, setPresets] = useState<PresetLite[]>([]);
+  const [presetsOpen, setPresetsOpen] = useState(false);
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
+
+  // Fetch presets on mount
+  useEffect(() => {
+    fetch("/api/presets")
+      .then((r) => r.ok ? r.json() : { presets: [] })
+      .then((data) => setPresets(data.presets ?? []))
+      .catch(() => setPresets([]));
+  }, []);
+
+  // Capture current form state as a ScanInput (for saving)
+  function captureInput(): ScanInput {
+    return {
+      businessDescription: business,
+      icp,
+      signalTypes,
+      keywords: keywords.length ? keywords : undefined,
+      subreddits: subreddits.length ? subreddits : undefined,
+      antiSignals: antiSignals.length ? antiSignals : undefined,
+      timeWindow,
+      maxResults,
+      sources: ["reddit"],
+      campaignKey: campaignKey.trim() || undefined,
+      voice: voice.trim() || undefined,
+      includeComments,
+      enrichAuthors,
+      draftReplies,
+      hubspotToken: hubspotToken.trim() || undefined,
+      hubspotOwnerId: hubspotOwnerId.trim() || undefined,
+      hubspotPushThreshold: hubspotToken.trim() ? hubspotPushThreshold : undefined,
+    };
+  }
+
+  // Apply a loaded preset's input to all form fields
+  function applyPreset(input: ScanInput) {
+    setBusiness(input.businessDescription ?? "");
+    setIcp(input.icp ?? "");
+    setSignalTypes(input.signalTypes ?? []);
+    setKeywords(input.keywords ?? []);
+    setSubreddits(input.subreddits ?? []);
+    setAntiSignals(input.antiSignals ?? []);
+    setTimeWindow(input.timeWindow ?? "week");
+    setMaxResults(input.maxResults ?? 25);
+    setCampaignKey(input.campaignKey ?? "");
+    setVoice(input.voice ?? "");
+    setIncludeComments(input.includeComments ?? true);
+    setEnrichAuthors(input.enrichAuthors ?? true);
+    setDraftReplies(input.draftReplies ?? true);
+    setHubspotToken(input.hubspotToken ?? "");
+    setHubspotOwnerId(input.hubspotOwnerId ?? "");
+    setHubspotPushThreshold(input.hubspotPushThreshold ?? 70);
+    // Open advanced if the preset uses any advanced fields
+    if (input.antiSignals?.length || input.campaignKey || input.voice || input.hubspotToken) {
+      setAdvOpen(true);
+    }
+  }
+
+  async function loadPreset(id: string) {
+    setPresetsOpen(false);
+    try {
+      const res = await fetch(`/api/presets/${id}`);
+      if (!res.ok) throw new Error("Failed to load");
+      const { preset } = await res.json() as { preset: ScanPreset };
+      applyPreset(preset.input);
+    } catch (e: any) {
+      setError(`Couldn't load preset: ${e?.message ?? e}`);
+    }
+  }
+
+  async function savePreset() {
+    if (!saveName.trim()) return;
+    setSaving(true);
+    try {
+      const res = await fetch("/api/presets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: saveName.trim(), input: captureInput() }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Save failed");
+      setPresets((prev) => [{
+        id: json.preset.id,
+        name: json.preset.name,
+        createdAt: json.preset.createdAt,
+        updatedAt: json.preset.updatedAt,
+        preview: {
+          businessSnippet: business.slice(0, 90),
+          keywordCount: keywords.length,
+          subredditCount: subreddits.length,
+          campaignKey: campaignKey.trim() || null,
+          timeWindow,
+        },
+      }, ...prev]);
+      setSaveDialogOpen(false);
+      setSaveName("");
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 2000);
+    } catch (e: any) {
+      setError(`Couldn't save: ${e?.message ?? e}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deletePreset(id: string) {
+    // Optimistic — restore on failure
+    const snapshot = presets;
+    setPresets((prev) => prev.filter((p) => p.id !== id));
+    try {
+      const res = await fetch(`/api/presets/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Delete failed");
+    } catch {
+      setPresets(snapshot);
+    }
+  }
+
+  const canSave = useMemo(
+    () => business.trim().length >= 10 && icp.trim().length >= 5 && signalTypes.length > 0,
+    [business, icp, signalTypes],
+  );
 
   const canSubmit = useMemo(
     () => business.trim().length >= 10 && icp.trim().length >= 5 && signalTypes.length > 0,
@@ -109,7 +250,75 @@ export default function ScanForm() {
   }
 
   return (
-    <div className="max-w-3xl mx-auto px-6 pt-16 pb-24">
+    <div className="max-w-3xl mx-auto px-6 pt-10 pb-24">
+      {/* Saved setups picker */}
+      <div className="mb-6 flex items-center gap-2 flex-wrap">
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => setPresetsOpen((v) => !v)}
+            className="text-[11px] font-mono uppercase tracking-[0.18em] px-3 py-1.5 rounded-md border border-[var(--line)] hover:border-[var(--line-strong)] bg-[var(--bg-elev)] flex items-center gap-2"
+          >
+            <Bookmark size={12} />
+            Saved setups
+            {presets.length > 0 && (
+              <span className="text-[var(--text-faint)]">({presets.length})</span>
+            )}
+            <ChevronDown size={12} className={`transition-transform ${presetsOpen ? "rotate-180" : ""}`} />
+          </button>
+          {presetsOpen && (
+            <div className="absolute left-0 top-full mt-1 w-[420px] max-w-[90vw] max-h-[420px] overflow-y-auto z-20 rounded-md border border-[var(--line-strong)] bg-[var(--bg-elev-2)] shadow-2xl">
+              {presets.length === 0 ? (
+                <div className="p-4 text-xs text-[var(--text-faint)] text-center">
+                  No saved setups yet. Fill out the form and click <span className="font-mono">Save setup</span> below.
+                </div>
+              ) : (
+                <ul className="divide-y divide-[var(--line)]">
+                  {presets.map((p) => (
+                    <li key={p.id} className="group">
+                      <div className="flex items-stretch">
+                        <button
+                          type="button"
+                          onClick={() => loadPreset(p.id)}
+                          className="flex-1 text-left p-3 hover:bg-[var(--bg-elev)] transition-colors min-w-0"
+                        >
+                          <div className="font-medium text-[13px] truncate">{p.name}</div>
+                          <div className="text-[11px] text-[var(--text-faint)] mt-0.5 truncate">
+                            {p.preview.businessSnippet || <em className="opacity-60">no description</em>}
+                          </div>
+                          <div className="text-[10px] font-mono text-[var(--text-faint)] mt-1 flex gap-3 flex-wrap">
+                            <span>{p.preview.timeWindow}</span>
+                            <span>{p.preview.keywordCount} kw</span>
+                            <span>{p.preview.subredditCount} subs</span>
+                            {p.preview.campaignKey && <span>· {p.preview.campaignKey}</span>}
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (confirm(`Delete saved setup "${p.name}"?`)) deletePreset(p.id);
+                          }}
+                          className="px-3 text-[var(--text-faint)] hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
+                          aria-label="Delete"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+        {savedFlash && (
+          <span className="text-[11px] font-mono text-[var(--amber)] flex items-center gap-1 animate-fade-up">
+            <Check size={12} /> Saved
+          </span>
+        )}
+      </div>
+
       {/* Hero */}
       <div className="mb-14 animate-fade-up">
         <div className="text-[11px] font-mono uppercase tracking-[0.22em] text-[var(--text-faint)] mb-4">
@@ -282,12 +491,72 @@ export default function ScanForm() {
             <div className="text-xs text-[var(--text-faint)] font-mono">
               Reddit API · Claude Sonnet 4.6 · ~60–120s per scan
             </div>
-            <button type="button" onClick={submit} disabled={!canSubmit || submitting} className="btn btn-primary px-6 py-3">
-              {submitting ? (<><Loader2 size={16} className="animate-spin" /> Starting scan…</>) : (<><Sparkles size={16} /> Run scan <ArrowRight size={16} /></>)}
-            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setSaveDialogOpen(true)}
+                disabled={!canSave}
+                className="btn px-4 py-3"
+                title={canSave ? "Save current form as a reusable setup" : "Fill out business + ICP first"}
+              >
+                <Bookmark size={14} /> Save setup
+              </button>
+              <button type="button" onClick={submit} disabled={!canSubmit || submitting} className="btn btn-primary px-6 py-3">
+                {submitting ? (<><Loader2 size={16} className="animate-spin" /> Starting scan…</>) : (<><Sparkles size={16} /> Run scan <ArrowRight size={16} /></>)}
+              </button>
+            </div>
           </div>
         </div>
       </div>
+
+      {/* Save dialog */}
+      {saveDialogOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => !saving && setSaveDialogOpen(false)}
+        >
+          <div
+            className="bg-[var(--bg-elev-2)] border border-[var(--line-strong)] rounded-lg p-6 w-full max-w-md shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="font-display text-xl mb-1">Save scan setup</h3>
+            <p className="text-xs text-[var(--text-faint)] mb-4">
+              Give this setup a name so you can reload it later. The full form (business, ICP, keywords, subs, advanced
+              options) will be saved.
+            </p>
+            <input
+              autoFocus
+              className="input w-full mb-3"
+              placeholder="e.g. Osome SG, Veloka PM, Material Daily"
+              maxLength={80}
+              value={saveName}
+              onChange={(e) => setSaveName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && saveName.trim()) savePreset();
+                if (e.key === "Escape") setSaveDialogOpen(false);
+              }}
+            />
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                type="button"
+                onClick={() => setSaveDialogOpen(false)}
+                disabled={saving}
+                className="btn px-4 py-2"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={savePreset}
+                disabled={!saveName.trim() || saving}
+                className="btn btn-primary px-4 py-2"
+              >
+                {saving ? <><Loader2 size={14} className="animate-spin" /> Saving</> : <><Check size={14} /> Save</>}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -11,7 +11,7 @@
 
 import { promises as fs } from "fs";
 import path from "path";
-import type { Scan } from "../types";
+import type { Scan, ScanPreset } from "../types";
 
 export interface Storage {
   list(): Promise<Scan[]>;
@@ -22,11 +22,18 @@ export interface Storage {
   // Campaign-level cross-scan dedup
   getSeen(campaignKey: string): Promise<Set<string>>;
   addSeen(campaignKey: string, ids: string[]): Promise<void>;
+
+  // Saved scan setups (templates that can be loaded into the form)
+  listPresets(): Promise<ScanPreset[]>;
+  getPreset(id: string): Promise<ScanPreset | null>;
+  putPreset(preset: ScanPreset): Promise<void>;
+  deletePreset(id: string): Promise<void>;
 }
 
 const DATA_DIR = path.join(process.cwd(), ".data");
 const SCANS_FILE = path.join(DATA_DIR, "scans.json");
 const SEEN_FILE = path.join(DATA_DIR, "seen.json");
+const PRESETS_FILE = path.join(DATA_DIR, "presets.json");
 
 async function ensureDir(): Promise<void> {
   try { await fs.mkdir(DATA_DIR, { recursive: true }); } catch {}
@@ -72,11 +79,30 @@ class FileStorage implements Storage {
     seen[campaignKey] = arr.slice(-5000);
     await writeJson(SEEN_FILE, seen);
   }
+  async listPresets() {
+    const all = await readJson<ScanPreset[]>(PRESETS_FILE, []);
+    return all.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  async getPreset(id: string) {
+    const all = await readJson<ScanPreset[]>(PRESETS_FILE, []);
+    return all.find((p) => p.id === id) ?? null;
+  }
+  async putPreset(preset: ScanPreset) {
+    const all = await readJson<ScanPreset[]>(PRESETS_FILE, []);
+    const idx = all.findIndex((p) => p.id === preset.id);
+    if (idx === -1) all.push(preset); else all[idx] = preset;
+    await writeJson(PRESETS_FILE, all);
+  }
+  async deletePreset(id: string) {
+    const all = await readJson<ScanPreset[]>(PRESETS_FILE, []);
+    await writeJson(PRESETS_FILE, all.filter((p) => p.id !== id));
+  }
 }
 
 class MemoryStorage implements Storage {
   private store = new Map<string, Scan>();
   private seen = new Map<string, Set<string>>();
+  private presets = new Map<string, ScanPreset>();
   async list() { return Array.from(this.store.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
   async get(id: string) { return this.store.get(id) ?? null; }
   async put(scan: Scan) { this.store.set(scan.id, scan); }
@@ -87,6 +113,12 @@ class MemoryStorage implements Storage {
     for (const id of ids) cur.add(id);
     this.seen.set(campaignKey, cur);
   }
+  async listPresets() {
+    return Array.from(this.presets.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  async getPreset(id: string) { return this.presets.get(id) ?? null; }
+  async putPreset(preset: ScanPreset) { this.presets.set(preset.id, preset); }
+  async deletePreset(id: string) { this.presets.delete(id); }
 }
 
 const useMemory = process.env.VERCEL === "1" || process.env.NODE_ENV === "production";

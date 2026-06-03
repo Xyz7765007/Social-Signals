@@ -62,6 +62,24 @@ export interface ScanInput {
   hubspotPushThreshold?: number; // default 70
 }
 
+/**
+ * Saved scan setup. Lets users (Kunal, team) save a named scan config and
+ * reload it on the form rather than re-pasting business description, ICP,
+ * keywords, subreddits etc. every time. Common pattern: per-client preset
+ * ("Osome SG", "Osome HK") + per-campaign-stage variant.
+ *
+ * Stored separately from Scan records — presets are templates, scans are runs.
+ */
+export interface ScanPreset {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  /** The full scan config, ready to apply to the form. campaignKey, hubspot
+   *  token, etc. are all included — user can override per-run on the form. */
+  input: ScanInput;
+}
+
 export interface RawPost {
   sourceId: SourceId;
   externalId: string;
