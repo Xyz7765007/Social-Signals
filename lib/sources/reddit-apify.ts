@@ -68,17 +68,26 @@ const TIME_WINDOW_MS: Record<string, number> = {
 /**
  * Subreddits per Apify run.
  *
- * The actor processes startUrls sequentially within a single browser worker.
- * With scrollTimeout=25s, each sub takes ~35-45s (load + scroll + extract).
- * Per-chunk time: subs × 40s + 20s actor startup.
+ * The actor visits startUrls SEQUENTIALLY in a single browser. Two timers
+ * matter here, and people confuse them:
  *
- * At 4 subs/chunk = ~180s, right at the actor timeout cliff — we observed
- * one chunk succeeding (156s) and the other timing out (180s). Dropping to
- * 3 subs/chunk = ~140s gives 40s of safety margin.
+ *   - scrollTimeout (per page): how long to scroll EACH listing for more
+ *     items. Set to 20s. This is the input field on the actor.
  *
- * RAM impact: 3 parallel runs × 2GB = 6GB total, fits Apify Free's 8GB cap.
+ *   - Actor timeout (per run): TOTAL wall time for the whole run. Set via
+ *     `&timeout=180` on the API URL. This is the hard cap that kills the run.
+ *
+ * For a 3-sub chunk, total ≈ subs × (page-load + scroll + extract) + startup.
+ * With heavy subs (r/singapore, r/Entrepreneur, r/smallbusiness), per-page
+ * time can hit 50-60s — so 3 heavies × 55s + 30s overhead = ~195s, exceeds
+ * the 180s actor timeout. We observed this exact failure.
+ *
+ * With 2 subs per chunk: 2 × 55s + 30s = ~140s worst case. Comfortably under.
+ *
+ * Cost: same total Apify spend (same total subs scraped); we just split into
+ * more parallel runs. RAM: 4 × 2GB = 8GB total, at Apify Free's cap.
  */
-const SUBS_PER_APIFY_CALL = 3;
+const SUBS_PER_APIFY_CALL = 2;
 
 /**
  * Round-robin distribute subs across N chunks instead of slicing.
