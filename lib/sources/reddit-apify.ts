@@ -66,6 +66,26 @@ const TIME_WINDOW_MS: Record<string, number> = {
   month: 30 * 24 * 60 * 60 * 1000,
 };
 
+/**
+ * Subreddits per Apify run.
+ *
+ * The actor processes startUrls sequentially within a single browser worker,
+ * not in parallel. So 8 subs in one run = ~280-320s (exceeds Vercel's 300s
+ * cap). Splitting into 2 parallel runs of 4 subs each = ~140-160s total
+ * since Promise.all waits for max(run1, run2) not sum.
+ *
+ * Apify Free plan allows multiple concurrent runs as long as total memory
+ * fits the 8GB plan limit. With memory=2048 per run × 2 parallel = 4GB,
+ * comfortably within free tier.
+ */
+const SUBS_PER_APIFY_CALL = 4;
+
+function chunkArr<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 interface ApifyItem {
   id?: string; parsedId?: string; url?: string;
   username?: string; author?: string;
@@ -86,17 +106,16 @@ interface ActorRunResult {
 }
 
 async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
-  // memory=8192 gives the actor ~8-way browser parallelism (Apify's
-  // Crawlee allocates ~512MB per concurrent browser). With 8 subreddit
-  // listings × 30s scrollTimeout, sequential = 240s (exceeds Vercel cap).
-  // 8-way parallel = ~30-50s. timeout=240s leaves room for orchestrator
-  // overhead within Vercel's 300s function limit.
-  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=8192&timeout=240`;
+  // memory=2048 per call. With 2 parallel calls = 4GB total, fits Free plan
+  // (8GB cap). Each call handles ≤4 startUrls, sequential within run, so
+  // actor time per call ≈ 4 × 35s = 140s. Parallel calls = ~140s total.
+  // timeout=180 leaves buffer for actor startup overhead.
+  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=180`;
   const res = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-  }, { label: `apify ${actorId}`, timeoutMs: 260_000, retries: 0 });
+  }, { label: `apify ${actorId}`, timeoutMs: 200_000, retries: 0 });
   if (!res.ok) {
     const errBody = await res.text().catch(() => "");
     throw new Error(`Apify run failed: ${res.status} ${errBody.slice(0, 200)}`);
@@ -218,75 +237,85 @@ export const redditApifySource: Source = {
     const token = process.env.APIFY_TOKEN!;
     const actorId = process.env.APIFY_REDDIT_ACTOR_ID ?? DEFAULT_ACTOR;
 
-    // Use SUBREDDIT LISTINGS, not search URLs. Reddit's anti-bot is much
-    // less aggressive on listings — these are how every Reddit user browses.
     const subList = subreddits && subreddits.length > 0 ? subreddits : ["all"];
-    const startUrls = subList.map((sub) => ({
-      url: `https://www.reddit.com/r/${sub}/new/`,
+
+    // Split subs into chunks — each chunk becomes a parallel Apify run.
+    // See SUBS_PER_APIFY_CALL comment for why this matters.
+    const subChunks = chunkArr(subList, SUBS_PER_APIFY_CALL);
+
+    // Total raw posts we want across all chunks. Cap at HARD_FETCH_CAP × 2
+    // (we filter heavily after, so over-fetch is fine).
+    const targetTotalAcrossChunks = Math.min(
+      subList.length * PER_SUB_LISTING_CAP,
+      HARD_FETCH_CAP * 2,
+    );
+    const targetPerChunk = Math.ceil(targetTotalAcrossChunks / subChunks.length);
+
+    const windowMs = TIME_WINDOW_MS[timeWindow] ?? TIME_WINDOW_MS.week;
+    const postDateLimit = new Date(Date.now() - windowMs).toISOString();
+
+    // Optional proxy override — actor default is RESIDENTIAL which is what
+    // we want. Opt-out to cheaper datacenter only via env var.
+    const proxyOverride = process.env.APIFY_DATACENTER_PROXY === "true"
+      ? { proxy: { useApifyProxy: true, apifyProxyGroups: [] } }
+      : {};
+
+    // Fire all chunks in parallel. One chunk's failure doesn't kill the
+    // whole fetch — we collect what we can.
+    const chunkResults = await Promise.all(subChunks.map(async (subs, idx) => {
+      const startUrls = subs.map((sub) => ({
+        url: `https://www.reddit.com/r/${sub}/new/`,
+      }));
+      try {
+        return await runActor(actorId, token, {
+          startUrls,
+          // `sort` is IGNORED when startUrls are provided — the URL determines
+          // sort. Same for `time`. We rely on /new/ in the URL + post-filter.
+          skipComments: true,
+          skipCommunity: true,
+          skipUserPosts: true,
+          includeNSFW: false,
+          maxItems: targetPerChunk,
+          maxPostCount: PER_SUB_LISTING_CAP,
+          // scrollTimeout (seconds): how long to keep scrolling per page to
+          // load more items. We only need 25 posts (one Reddit page worth)
+          // but the actor needs scroll time anyway to render and stabilize.
+          // 25s is the safe floor — lower than this caused early page bail.
+          scrollTimeout: 25,
+          postDateLimit,
+          ...proxyOverride,
+        });
+      } catch (e: any) {
+        // One chunk failing shouldn't kill the others
+        console.warn(`Apify chunk ${idx} (${subs.join(",")}) failed:`, e?.message);
+        return { items: [], costUsd: 0 };
+      }
     }));
 
-    // Pull more posts than we'll keep — keyword/time filter happens in code,
-    // so the actor needs slack. Apify cost is bounded by maxItems.
-    const targetTotal = Math.min(subList.length * PER_SUB_LISTING_CAP, HARD_FETCH_CAP * 2);
-
-    const { items, costUsd } = await runActor(actorId, token, {
-      startUrls,
-      sort: "new",
-      // Schema flags — drop the work we don't need so the actor finishes faster.
-      skipComments: true,   // listing scrape doesn't need per-post comments
-      skipCommunity: true,  // don't pull community metadata pages
-      skipUserPosts: true,  // don't follow into user profiles
-      includeNSFW: false,   // actor default is TRUE — explicitly off
-      maxItems: targetTotal,
-      maxPostCount: PER_SUB_LISTING_CAP,
-      // scrollTimeout (seconds): time the actor keeps scrolling the listing
-      // page to load more posts via infinite scroll. Actor's default is 40s.
-      // We set 30s — gives Reddit's JS-heavy page time to render the initial
-      // listing AND a few seconds to load any lazy-rendered posts, but
-      // shaves off enough to fit within Vercel's 300s function cap when
-      // running across 8 subs with memory=8192 parallelism.
-      // Going lower (e.g. 8s) caused pages to bail before fully rendering →
-      // 1-4 posts pulled instead of 25.
-      scrollTimeout: 30,
-      // Server-side time filter — let actor skip pages of old posts.
-      // Format is ISO date string; actor stops when it sees posts older
-      // than this. Backstopped by our in-code time filter below.
-      postDateLimit: new Date(Date.now() - (TIME_WINDOW_MS[timeWindow] ?? TIME_WINDOW_MS.week)).toISOString(),
-      // proxy: omitted — actor default is `{useApifyProxy: true,
-      // apifyProxyGroups: ["RESIDENTIAL"]}` which is what we want. Overriding
-      // to plain datacenter was making us look like a bot to Reddit. Opt-out
-      // to datacenter (cheaper but unreliable) via APIFY_DATACENTER_PROXY=true.
-      ...(process.env.APIFY_DATACENTER_PROXY === "true"
-        ? { proxy: { useApifyProxy: true, apifyProxyGroups: [] } }
-        : {}),
-    });
+    // Merge items and costs across all parallel runs
+    const allItems = chunkResults.flatMap((r) => r.items);
+    const costUsd = chunkResults.reduce((sum, r) => sum + r.costUsd, 0);
 
     // ── Post-filter by time window ───────────────────────────────────────
-    const windowMs = TIME_WINDOW_MS[timeWindow] ?? TIME_WINDOW_MS.week;
     const cutoff = Date.now() - windowMs;
 
     // ── Post-filter by keyword match ─────────────────────────────────────
-    // Match substring (case-insensitive) in title + body. Multi-word
-    // phrases match if the phrase appears together. Single words match
-    // anywhere.
     const kwLower = keywords.map(normalizeKw).filter((k) => k.length >= 2);
     if (kwLower.length === 0) {
       return { items: [], costUsd };
     }
 
     const matched: RawPost[] = [];
-    for (const it of items) {
+    for (const it of allItems) {
       if (it.over18 || it.isAd) continue;
       if (it.dataType && it.dataType !== "post") continue;
 
       const post = mapPost(it);
       if (!post) continue;
 
-      // Time filter
       const createdMs = new Date(post.createdAt).getTime();
       if (!Number.isFinite(createdMs) || createdMs < cutoff) continue;
 
-      // Keyword filter — any keyword appearing as substring counts
       const haystack = postHaystack(post);
       const hasMatch = kwLower.some((kw) => haystack.includes(kw));
       if (!hasMatch) continue;
@@ -294,7 +323,7 @@ export const redditApifySource: Source = {
       matched.push(post);
     }
 
-    // Dedup by externalId
+    // Dedup
     const seen = new Set<string>();
     const deduped: RawPost[] = [];
     for (const p of matched) {
@@ -303,7 +332,6 @@ export const redditApifySource: Source = {
       deduped.push(p);
     }
 
-    // Sort newest first, then by upvotes as tiebreaker
     deduped.sort((a, b) => {
       const t = b.createdAt.localeCompare(a.createdAt);
       if (t !== 0) return t;
@@ -318,28 +346,30 @@ export const redditApifySource: Source = {
     const token = process.env.APIFY_TOKEN!;
     const actorId = process.env.APIFY_REDDIT_ACTOR_ID ?? DEFAULT_ACTOR;
 
-    // Only pull comments for posts likely to have signal
+    // Only pull comments for posts likely to have signal. Cap at 8 (down
+    // from 15) — actor processes these sequentially in one browser, so
+    // 15 × ~15s = 225s vs 8 × ~15s = 120s. Lower count keeps us in budget
+    // within Vercel's 300s cap after the listings fetch.
     const candidates = posts
       .filter((p) => !p.isComment)
       .filter((p) => (p.metadata.comments ?? 0) >= 2 || (p.metadata.upvotes ?? 0) >= 3)
-      .slice(0, 15);
+      .slice(0, 8);
     if (candidates.length === 0) return { items: [], costUsd: 0 };
 
     const parents = new Map(candidates.map((p) => [p.externalId, p]));
 
     // For comments, scrape individual post URLs — those work fine through
-    // Apify since they're not search.
+    // Apify since they're not search pages.
     const { items, costUsd } = await runActor(actorId, token, {
       startUrls: candidates.map((p) => ({ url: p.url })),
-      sort: "top",
+      // `sort` is IGNORED with startUrls — URL determines comment sort.
+      // Reddit's default is "best" which surfaces top-voted, which is fine.
       skipUserPosts: true,
       skipCommunity: true,
       includeNSFW: false,
       maxItems: candidates.length * maxPerPost,
       maxComments: maxPerPost,
-      // 15s scroll budget for comment pages — top comments are at the top
-      // and load quickly, but Reddit's post page still needs ~5-10s to
-      // render before extraction. 15s is a safe floor.
+      // 15s gives post page time to render. Top comments load at the top.
       scrollTimeout: 15,
       ...(process.env.APIFY_DATACENTER_PROXY === "true"
         ? { proxy: { useApifyProxy: true, apifyProxyGroups: [] } }
