@@ -127,42 +127,66 @@ interface ActorRunResult {
 }
 
 async function runActor(actorId: string, token: string, input: any): Promise<ActorRunResult> {
-  // memory=2048 per call. With 2 parallel calls = 4GB total, fits Free plan
-  // (8GB cap). Each call handles ≤4 startUrls, sequential within run, so
-  // actor time per call ≈ 4 × 35s = 140s. Parallel calls = ~140s total.
-  // timeout=180 leaves buffer for actor startup overhead.
-  const url = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync-get-dataset-items?token=${token}&memory=2048&timeout=180`;
-  const res = await fetchWithRetry(url, {
+  // Two-call pattern: POST /run-sync gives us the run object (with reliable
+  // `usageTotalUsd`), then GET /datasets/{id}/items pulls the data.
+  //
+  // Why not /run-sync-get-dataset-items (one call): that endpoint returns
+  // raw items but we have to extract runId from response headers to fetch
+  // cost separately. Header names have changed across Apify API versions
+  // and we saw cost lookups silently returning 0 in production. The run
+  // object explicitly contains usageTotalUsd + defaultDatasetId — both
+  // structured fields we can rely on.
+  //
+  // Cost: 2 HTTP requests instead of 1, but second one is fast (<2s).
+  const runUrl = `${APIFY_API}/acts/${encodeURIComponent(actorId)}/run-sync?token=${token}&memory=2048&timeout=180`;
+  const runRes = await fetchWithRetry(runUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(input),
-  }, { label: `apify ${actorId}`, timeoutMs: 200_000, retries: 0 });
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => "");
-    throw new Error(`Apify run failed: ${res.status} ${errBody.slice(0, 200)}`);
-  }
-  const runId = res.headers.get("X-Apify-Run-Id") ?? res.headers.get("x-apify-run-id");
-  const items: ApifyItem[] = await res.json();
+  }, { label: `apify ${actorId} run`, timeoutMs: 200_000, retries: 0 });
 
-  let costUsd = 0;
-  if (runId) {
-    try {
-      const runRes = await fetchWithRetry(
-        `${APIFY_API}/actor-runs/${runId}?token=${token}`,
-        {},
-        { label: "apify run cost", timeoutMs: 15_000, retries: 1 },
-      );
-      if (runRes.ok) {
-        const data: any = await runRes.json();
-        const reported = Number(data?.data?.usageTotalUsd ?? 0);
-        if (Number.isFinite(reported) && reported >= 0) costUsd = reported;
-      }
-    } catch (e) {
-      console.warn("Apify cost lookup failed (continuing with cost=0):", e);
-    }
+  if (!runRes.ok) {
+    const errBody = await runRes.text().catch(() => "");
+    throw new Error(`Apify run failed: ${runRes.status} ${errBody.slice(0, 200)}`);
   }
 
-  return { items, costUsd };
+  const runJson: any = await runRes.json();
+  // Apify wraps in { data: {...} }; some clients see it flat. Support both.
+  const run = runJson?.data ?? runJson;
+
+  // Cost — structured, reliable, billed amount
+  const reportedCost = Number(run?.usageTotalUsd ?? 0);
+  const costUsd = Number.isFinite(reportedCost) && reportedCost >= 0 ? reportedCost : 0;
+
+  // Dataset ID — where the actor pushed its scraped items
+  const datasetId = run?.defaultDatasetId ?? run?.datasetId;
+  if (!datasetId) {
+    console.warn(`Apify run ${run?.id ?? "?"} succeeded but has no defaultDatasetId. Status: ${run?.status}`);
+    return { items: [], costUsd };
+  }
+
+  // Step 2: fetch dataset items. limit=500 covers HARD_FETCH_CAP * 2.
+  // clean=1 strips internal metadata (smaller response).
+  const itemsUrl = `${APIFY_API}/datasets/${encodeURIComponent(datasetId)}/items?token=${token}&format=json&clean=1&limit=500`;
+  const itemsRes = await fetchWithRetry(itemsUrl, {}, {
+    label: `apify dataset ${datasetId}`,
+    timeoutMs: 30_000,
+    retries: 1,
+  });
+
+  if (!itemsRes.ok) {
+    console.warn(`Apify dataset ${datasetId} fetch failed: ${itemsRes.status}`);
+    return { items: [], costUsd };
+  }
+
+  const items: any = await itemsRes.json();
+  if (!Array.isArray(items)) {
+    console.warn(`Apify dataset ${datasetId} returned non-array:`, typeof items);
+    return { items: [], costUsd };
+  }
+
+  console.log(`Apify run ${run?.id ?? "?"} → ${items.length} items, $${costUsd.toFixed(4)}`);
+  return { items: items as ApifyItem[], costUsd };
 }
 
 function mapPost(it: ApifyItem): RawPost | null {
@@ -237,6 +261,53 @@ function mapComment(it: ApifyItem, parents: Map<string, RawPost>): RawPost | nul
  */
 function normalizeKw(kw: string): string {
   return kw.toLowerCase().replace(/\s+/g, " ").replace(/^["']|["']$/g, "").trim();
+}
+
+/**
+ * Generic words that match too broadly to be useful as anchors. If the user's
+ * keyword is "accounting services" and we anchored on "services" alone, every
+ * single SaaS / agency / consultancy post on r/Entrepreneur would match.
+ * "Company", "business", etc. are universally present in business subreddits.
+ */
+const ANCHOR_DENYLIST = new Set([
+  // Articles, prepositions, pronouns
+  "the", "a", "an", "of", "in", "for", "to", "and", "or", "is", "are",
+  "with", "by", "from", "on", "at", "as", "be", "my", "we", "i", "you",
+  // Generic biz nouns — present in nearly every business post
+  "company", "business", "service", "services", "provider", "providers",
+  "firm", "firms",
+  // Verbs that match too broadly
+  "looking", "find", "get", "want", "need", "use", "using",
+]);
+
+/**
+ * Build keyword matchers from user input. Returns:
+ *   - phrases: full multi-word substrings (e.g. "incorporate company")
+ *   - anchors: significant single words extracted from phrases (e.g.
+ *     "incorporate", "accounting", "singapore", "bookkeeping")
+ *
+ * A post matches if EITHER its haystack contains a full phrase OR contains
+ * at least one anchor word. This is much more forgiving than requiring
+ * exact phrase substrings — "looking for an accountant" matches anchor
+ * "accountant" even though it doesn't match phrase "looking for accountant".
+ */
+function buildKeywordMatchers(keywords: string[]): { phrases: string[]; anchors: string[] } {
+  const phraseSet = new Set<string>();
+  const anchorSet = new Set<string>();
+  for (const kw of keywords) {
+    const norm = normalizeKw(kw);
+    if (norm.length < 2) continue;
+    phraseSet.add(norm);
+    // Also extract individual significant words as anchors
+    for (const word of norm.split(/\s+/)) {
+      // Min length 3 to avoid "a", "to" etc, but allow short specific terms
+      // like "gst", "acra", "ai"
+      if (word.length >= 3 && !ANCHOR_DENYLIST.has(word)) {
+        anchorSet.add(word);
+      }
+    }
+  }
+  return { phrases: Array.from(phraseSet), anchors: Array.from(anchorSet) };
 }
 
 /**
@@ -329,28 +400,56 @@ export const redditApifySource: Source = {
     const cutoff = Date.now() - windowMs;
 
     // ── Post-filter by keyword match ─────────────────────────────────────
-    const kwLower = keywords.map(normalizeKw).filter((k) => k.length >= 2);
-    if (kwLower.length === 0) {
+    // Match either a full phrase OR any anchor word. The old "phrase-only"
+    // filter was so strict it dropped posts like "I need an accountant"
+    // because that doesn't contain the exact phrase "looking for accountant".
+    const { phrases, anchors } = buildKeywordMatchers(keywords);
+    if (phrases.length === 0 && anchors.length === 0) {
       return { items: [], costUsd };
     }
 
+    let filteredByTime = 0;
+    let filteredByKeyword = 0;
+    let filteredOther = 0;
+
     const matched: RawPost[] = [];
     for (const it of allItems) {
-      if (it.over18 || it.isAd) continue;
-      if (it.dataType && it.dataType !== "post") continue;
+      if (it.over18 || it.isAd) { filteredOther++; continue; }
+      if (it.dataType && it.dataType !== "post") { filteredOther++; continue; }
 
       const post = mapPost(it);
-      if (!post) continue;
+      if (!post) { filteredOther++; continue; }
 
       const createdMs = new Date(post.createdAt).getTime();
-      if (!Number.isFinite(createdMs) || createdMs < cutoff) continue;
+      if (!Number.isFinite(createdMs) || createdMs < cutoff) {
+        filteredByTime++;
+        continue;
+      }
 
       const haystack = postHaystack(post);
-      const hasMatch = kwLower.some((kw) => haystack.includes(kw));
-      if (!hasMatch) continue;
+      let hasMatch = false;
+      for (const phrase of phrases) {
+        if (haystack.includes(phrase)) { hasMatch = true; break; }
+      }
+      if (!hasMatch) {
+        for (const anchor of anchors) {
+          if (haystack.includes(anchor)) { hasMatch = true; break; }
+        }
+      }
+      if (!hasMatch) {
+        filteredByKeyword++;
+        continue;
+      }
 
       matched.push(post);
     }
+
+    // Diagnostic so Vercel logs explain "why so few posts?"
+    console.log(
+      `Apify fetch: ${allItems.length} raw → ${matched.length} matched ` +
+      `(filtered: ${filteredByTime} old, ${filteredByKeyword} no-keyword-match, ${filteredOther} other) ` +
+      `| phrases=${phrases.length} anchors=${anchors.length}`,
+    );
 
     // Dedup
     const seen = new Set<string>();
