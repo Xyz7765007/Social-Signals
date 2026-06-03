@@ -69,16 +69,37 @@ const TIME_WINDOW_MS: Record<string, number> = {
 /**
  * Subreddits per Apify run.
  *
- * The actor processes startUrls sequentially within a single browser worker,
- * not in parallel. So 8 subs in one run = ~280-320s (exceeds Vercel's 300s
- * cap). Splitting into 2 parallel runs of 4 subs each = ~140-160s total
- * since Promise.all waits for max(run1, run2) not sum.
+ * The actor processes startUrls sequentially within a single browser worker.
+ * With scrollTimeout=25s, each sub takes ~35-45s (load + scroll + extract).
+ * Per-chunk time: subs × 40s + 20s actor startup.
  *
- * Apify Free plan allows multiple concurrent runs as long as total memory
- * fits the 8GB plan limit. With memory=2048 per run × 2 parallel = 4GB,
- * comfortably within free tier.
+ * At 4 subs/chunk = ~180s, right at the actor timeout cliff — we observed
+ * one chunk succeeding (156s) and the other timing out (180s). Dropping to
+ * 3 subs/chunk = ~140s gives 40s of safety margin.
+ *
+ * RAM impact: 3 parallel runs × 2GB = 6GB total, fits Apify Free's 8GB cap.
  */
-const SUBS_PER_APIFY_CALL = 4;
+const SUBS_PER_APIFY_CALL = 3;
+
+/**
+ * Round-robin distribute subs across N chunks instead of slicing.
+ *
+ * Why: subs vary wildly in traffic and page complexity. r/Entrepreneur and
+ * r/smallbusiness are huge and slow to scrape. r/sgsmallbusiness is tiny
+ * and fast. Slicing [0..3] vs [4..7] can stack all the slow ones in one
+ * chunk, guaranteeing that chunk times out.
+ *
+ * Round-robin guarantees each chunk has a mix — both an "easy" sub and a
+ * "hard" sub. No chunk gets stuck holding the bag.
+ */
+function distributeSubs(subs: string[]): string[][] {
+  const chunkCount = Math.max(1, Math.ceil(subs.length / SUBS_PER_APIFY_CALL));
+  const chunks: string[][] = Array.from({ length: chunkCount }, () => []);
+  for (let i = 0; i < subs.length; i++) {
+    chunks[i % chunkCount].push(subs[i]);
+  }
+  return chunks;
+}
 
 function chunkArr<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
@@ -239,9 +260,10 @@ export const redditApifySource: Source = {
 
     const subList = subreddits && subreddits.length > 0 ? subreddits : ["all"];
 
-    // Split subs into chunks — each chunk becomes a parallel Apify run.
-    // See SUBS_PER_APIFY_CALL comment for why this matters.
-    const subChunks = chunkArr(subList, SUBS_PER_APIFY_CALL);
+    // Round-robin distribute subs across chunks. Each chunk becomes a
+    // parallel Apify run. See distributeSubs comment for why round-robin
+    // vs straight slicing matters.
+    const subChunks = distributeSubs(subList);
 
     // Total raw posts we want across all chunks. Cap at HARD_FETCH_CAP × 2
     // (we filter heavily after, so over-fetch is fine).
@@ -260,6 +282,10 @@ export const redditApifySource: Source = {
       ? { proxy: { useApifyProxy: true, apifyProxyGroups: [] } }
       : {};
 
+    // Track which chunks failed so the orchestrator can surface this in
+    // scan.warnings rather than the user seeing "0 posts" with no explanation.
+    const chunkFailures: string[] = [];
+
     // Fire all chunks in parallel. One chunk's failure doesn't kill the
     // whole fetch — we collect what we can.
     const chunkResults = await Promise.all(subChunks.map(async (subs, idx) => {
@@ -269,28 +295,31 @@ export const redditApifySource: Source = {
       try {
         return await runActor(actorId, token, {
           startUrls,
-          // `sort` is IGNORED when startUrls are provided — the URL determines
-          // sort. Same for `time`. We rely on /new/ in the URL + post-filter.
           skipComments: true,
           skipCommunity: true,
           skipUserPosts: true,
           includeNSFW: false,
           maxItems: targetPerChunk,
           maxPostCount: PER_SUB_LISTING_CAP,
-          // scrollTimeout (seconds): how long to keep scrolling per page to
-          // load more items. We only need 25 posts (one Reddit page worth)
-          // but the actor needs scroll time anyway to render and stabilize.
-          // 25s is the safe floor — lower than this caused early page bail.
           scrollTimeout: 25,
           postDateLimit,
           ...proxyOverride,
         });
       } catch (e: any) {
-        // One chunk failing shouldn't kill the others
-        console.warn(`Apify chunk ${idx} (${subs.join(",")}) failed:`, e?.message);
+        const msg = `Apify chunk ${idx + 1}/${subChunks.length} (${subs.join(", ")}) failed: ${e?.message ?? "unknown"}`;
+        console.warn(msg);
+        chunkFailures.push(msg);
         return { items: [], costUsd: 0 };
       }
     }));
+
+    // If EVERY chunk failed, this is a real fetch failure — throw so the
+    // orchestrator marks it as failed rather than completing with 0 posts.
+    if (chunkFailures.length === subChunks.length && subChunks.length > 0) {
+      throw new Error(
+        `All ${subChunks.length} Apify chunks failed. First error: ${chunkFailures[0]}`,
+      );
+    }
 
     // Merge items and costs across all parallel runs
     const allItems = chunkResults.flatMap((r) => r.items);
